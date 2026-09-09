@@ -241,6 +241,154 @@ async function saveProfile(data) {
 function parseLogTenPro(text) {
   const lines = text.split('\n').filter(l => l.trim());
   if (lines.length < 2) throw new Error('No data found');
+
+  // Detect format by checking headers
+  const firstLine = lines[0].replace(/^\uFEFF/, ''); // remove BOM
+  const isCSV = firstLine.includes('"Date"') || firstLine.includes('Date,');
+  
+  if (isCSV) {
+    return parseMyFlightbook(lines);
+  } else {
+    return parseTabDelimited(lines);
+  }
+}
+
+function parseMyFlightbook(lines) {
+  // Parse CSV with quoted fields
+  function parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        inQuotes = !inQuotes;
+      } else if (ch === ',' && !inQuotes) {
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  const headerLine = lines[0].replace(/^\uFEFF/, '').replace(/"/g, '');
+  const headers = headerLine.split(',').map(h => h.trim().toLowerCase());
+
+  function idx(name) {
+    return headers.findIndex(h => h === name.toLowerCase() || h.includes(name.toLowerCase()));
+  }
+
+  const entries = [];
+  for (let i = 1; i < lines.length; i++) {
+    const row = parseCSVLine(lines[i]);
+    if (row.length < 3) continue;
+
+    const get = (name) => {
+      const i2 = idx(name);
+      return i2 >= 0 ? (row[i2] || '').trim() : '';
+    };
+    const getNum = (name) => parseFloat(get(name)) || 0;
+    const getHHMM = (name) => {
+      const v = get(name);
+      if (!v) return 0;
+      if (v.includes(':')) {
+        const [h, m] = v.split(':');
+        return parseInt(h) + parseInt(m) / 60;
+      }
+      return parseFloat(v) || 0;
+    };
+
+    const dateRaw = get('date');
+    if (!dateRaw) continue;
+
+    // Parse date YYYY-MM-DD
+    let date = dateRaw;
+    if (dateRaw.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/)) {
+      const [m, d, y] = dateRaw.split('/');
+      date = y + '-' + m.padStart(2, '0') + '-' + d.padStart(2, '0');
+    }
+
+    const totalTime = getHHMM('total flight time (hh:mm)') || getNum('total flight time');
+    const simTime = getNum('ground simulator');
+    const dual = getNum('dual received');
+    const pic = getNum('pic');
+    const night = getNum('night');
+    const simInst = getNum('simulated instrument');
+    const imc = getNum('imc');
+    const xc = getNum('x-country');
+    const solo = getNum('solo time');
+    const dayLdgs = parseInt(getNum('fs day landings')) || 0;
+    const nightLdgs = parseInt(getNum('fs night landings')) || 0;
+    const approaches = parseInt(getNum('approaches')) || 0;
+    const holds = get('hold').toLowerCase() === 'yes' ? 1 : 0;
+
+    // Parse route
+    const route = get('route');
+    const airports = route.replace(/-/g, ' ').split(' ').filter(a => a.match(/^[A-Z]{2,4}$/));
+    const dep = airports[0] || '';
+    const arr = airports[airports.length - 1] || dep;
+
+    // Parse instructor from Flight Properties
+    const props = get('flight properties');
+    const instrMatch = props.match(/Instructor:\s*([^;]+)/i);
+    const instructor = instrMatch ? instrMatch[1].trim() : get('instructor name') || get('cfi name');
+    const lesson = get('lesson # / description') || get('comments');
+    const picName = get('name of pic') || 'J. Durr';
+
+    const isSim = simTime > 0 && totalTime === 0;
+    const apchList = [];
+    if (approaches > 0 && arr) {
+      for (let j = 0; j < Math.min(approaches, 5); j++) {
+        apchList.push({ type: 'ILS Cat I', rwy: '', airport: arr, result: 'Full Stop' });
+      }
+    }
+
+    let role = 'Dual (Student)';
+    if (isSim) role = 'Student / Trainee';
+    else if (solo > 0 && dual === 0) role = 'PIC (Solo)';
+    else if (pic > 0 && dual === 0 && !instructor) role = 'PIC';
+
+    entries.push({
+      pilot_id: state.session.user.id,
+      date,
+      source: 'myflightbook',
+      duty_type: isSim ? 'Simulator Duty' : 'Flight Duty',
+      flight_rules: (imc > 0 || simInst > 0 || approaches > 0) ? 'IFR' : 'VFR',
+      aircraft_type: get('icao model') || get('model') || '',
+      aircraft_reg: get('tail number') || '',
+      dep_airport: dep,
+      arr_airport: arr,
+      route: route,
+      total_time: isSim ? 0 : totalTime,
+      sim_time: simTime || (isSim ? totalTime : 0),
+      pic: pic,
+      sic: getNum('sic'),
+      picus: 0,
+      dual: dual,
+      solo: solo,
+      night: night,
+      ifr: imc,
+      sim_inst: simInst,
+      xc: xc,
+      day_landings: dayLdgs,
+      night_landings: nightLdgs,
+      holds: holds,
+      approaches: apchList,
+      pilot_role: role,
+      p1_name: picName,
+      p2_name: instructor ? 'J. Durr' : '',
+      instructor: instructor,
+      lesson: lesson,
+      remarks: get('comments'),
+    });
+  }
+  return entries;
+}
+
+function parseTabDelimited(lines) {
   const headers = lines[0].split('\t').map(h => h.trim().toLowerCase().replace(/[\s\/]+/g, '_'));
 
   const get = (row, ...names) => {
@@ -259,26 +407,24 @@ function parseLogTenPro(text) {
     const dateRaw = get(row, 'date');
     if (!dateRaw) continue;
 
-    // Normalise date to YYYY-MM-DD
     let date = dateRaw;
     if (dateRaw.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/)) {
-      const [m,d,y] = dateRaw.split('/');
-      date = y+'-'+m.padStart(2,'0')+'-'+d.padStart(2,'0');
+      const [m, d, y] = dateRaw.split('/');
+      date = y + '-' + m.padStart(2, '0') + '-' + d.padStart(2, '0');
     } else if (dateRaw.match(/^\d{4}-\d{2}-\d{2}/)) {
-      date = dateRaw.slice(0,10);
+      date = dateRaw.slice(0, 10);
     }
 
-    const totalTime = getNum(row,'flight_time','total','block');
-    const simTime = getNum(row,'sim','simulator','ground');
+    const totalTime = getNum(row, 'flight_time', 'total', 'block');
+    const simTime = getNum(row, 'sim', 'simulator', 'ground');
     if (totalTime === 0 && simTime === 0) continue;
 
     const approaches = [];
-    const apchCount = getNum(row,'approaches','approach');
+    const apchCount = getNum(row, 'approaches', 'approach');
     if (apchCount > 0) {
-      const apchType = get(row,'approach_type') || 'ILS Cat I';
-      const arr = get(row,'to','arrival','destination');
+      const arr = get(row, 'to', 'arrival', 'destination');
       for (let j = 0; j < Math.min(apchCount, 5); j++) {
-        approaches.push({type: apchType, rwy: '', airport: arr, result: 'Full Stop'});
+        approaches.push({ type: 'ILS Cat I', rwy: '', airport: arr, result: 'Full Stop' });
       }
     }
 
@@ -286,37 +432,38 @@ function parseLogTenPro(text) {
       pilot_id: state.session.user.id,
       date, source: 'logten',
       duty_type: simTime > 0 && totalTime === 0 ? 'Simulator Duty' : 'Flight Duty',
-      flight_rules: getNum(row,'actual_instrument','imc') > 0 ? 'IFR' : 'VFR',
-      aircraft_type: get(row,'aircraft_type','type','model','icao'),
-      aircraft_reg: get(row,'registration','tail','reg'),
-      dep_airport: get(row,'from','departure','origin'),
-      arr_airport: get(row,'to','arrival','destination'),
-      route: get(row,'route'),
+      flight_rules: getNum(row, 'actual_instrument', 'imc') > 0 ? 'IFR' : 'VFR',
+      aircraft_type: get(row, 'aircraft_type', 'type', 'model', 'icao'),
+      aircraft_reg: get(row, 'registration', 'tail', 'reg'),
+      dep_airport: get(row, 'from', 'departure', 'origin'),
+      arr_airport: get(row, 'to', 'arrival', 'destination'),
+      route: get(row, 'route'),
       total_time: totalTime,
       sim_time: simTime,
-      pic: getNum(row,'pic','pilot_in_command'),
-      sic: getNum(row,'sic','second_in_command','co_pilot'),
-      picus: getNum(row,'picus','pic_us'),
-      dual: getNum(row,'dual','dual_received'),
-      solo: getNum(row,'solo'),
-      night: getNum(row,'night'),
-      ifr: getNum(row,'actual_instrument','imc'),
-      sim_inst: getNum(row,'simulated_instrument','sim_inst'),
-      xc: getNum(row,'cross_country','x_country','xc'),
-      day_landings: parseInt(getNum(row,'day_ldg','day_landing','full_stop_day')) || 0,
-      night_landings: parseInt(getNum(row,'night_ldg','night_landing','full_stop_night')) || 0,
-      holds: parseInt(getNum(row,'holds','holding')) || 0,
+      pic: getNum(row, 'pic', 'pilot_in_command'),
+      sic: getNum(row, 'sic', 'second_in_command', 'co_pilot'),
+      picus: getNum(row, 'picus', 'pic_us'),
+      dual: getNum(row, 'dual', 'dual_received'),
+      solo: getNum(row, 'solo'),
+      night: getNum(row, 'night'),
+      ifr: getNum(row, 'actual_instrument', 'imc'),
+      sim_inst: getNum(row, 'simulated_instrument', 'sim_inst'),
+      xc: getNum(row, 'cross_country', 'x_country', 'xc'),
+      day_landings: parseInt(getNum(row, 'day_ldg', 'day_landing', 'full_stop_day')) || 0,
+      night_landings: parseInt(getNum(row, 'night_ldg', 'night_landing', 'full_stop_night')) || 0,
+      holds: parseInt(getNum(row, 'holds', 'holding')) || 0,
       approaches: approaches,
-      pilot_role: getNum(row,'pic') > 0 ? 'PIC' : getNum(row,'dual') > 0 ? 'Dual (Student)' : 'SIC',
-      p1_name: get(row,'pic_name','captain','p1'),
-      p2_name: get(row,'co_pilot_name','sic_name','p2'),
-      instructor: get(row,'instructor','instructor_name'),
-      lesson: get(row,'lesson','exercise','topic'),
-      remarks: get(row,'remarks','comments','notes'),
+      pilot_role: getNum(row, 'pic') > 0 ? 'PIC' : getNum(row, 'dual') > 0 ? 'Dual (Student)' : 'SIC',
+      p1_name: get(row, 'pic_name', 'captain', 'p1'),
+      p2_name: get(row, 'co_pilot_name', 'sic_name', 'p2'),
+      instructor: get(row, 'instructor', 'instructor_name'),
+      lesson: get(row, 'lesson', 'exercise', 'topic'),
+      remarks: get(row, 'remarks', 'comments', 'notes'),
     });
   }
   return entries;
 }
+
 
 async function importEntries(entries) {
   const BATCH = 50;
