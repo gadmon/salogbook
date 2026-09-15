@@ -2171,7 +2171,7 @@ function render() {
         scanResult.appendChild(fields);
 
         const saveBtns = div({style:{display:'flex',gap:'8px',justifyContent:'flex-end'}});
-        saveBtns.appendChild(btn({style:{background:'none',border:'1px solid #CED4DA',color:'#555',borderRadius:'7px',padding:'8px 16px',fontSize:'13px',cursor:'pointer'},
+        saveBtns.append(btn({style:{background:'none',border:'1px solid #CED4DA',color:'#555',borderRadius:'7px',padding:'8px 16px',fontSize:'13px',cursor:'pointer'},
           onclick:()=>{
             // Open endorsement form pre-filled with extracted data
             setState({showAIScan:false, showEndorseForm:true, editEndorse:{
