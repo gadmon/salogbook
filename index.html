@@ -105,6 +105,18 @@
 <!-- Supabase JS -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
+<!-- On-device OCR for the document scanner (no API key, no billing, runs entirely in the browser) -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>
+  if (window['pdfjs-dist/build/pdf']) {
+    window.pdfjsLib = window['pdfjs-dist/build/pdf'];
+  }
+  if (window.pdfjsLib) {
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+  }
+</script>
+
 <script>
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 // Replace these with your Supabase project values
@@ -311,7 +323,7 @@ function parseLogTenPro(text) {
   if (lines.length < 2) throw new Error('No data found');
 
   // Detect format by checking headers
-  const firstLine = lines[0].replace(/^\uFEFF/, ''); // remove BOM
+  const firstLine = lines[0].replace(/^﻿/, ''); // remove BOM
   const isCSV = firstLine.includes('"Date"') || firstLine.includes('Date,');
   
   if (isCSV) {
@@ -342,7 +354,7 @@ function parseMyFlightbook(lines) {
     return result;
   }
 
-  const headerLine = lines[0].replace(/^\uFEFF/, '').replace(/"/g, '');
+  const headerLine = lines[0].replace(/^﻿/, '').replace(/"/g, '');
   const headers = headerLine.split(',').map(h => h.trim().toLowerCase());
 
   function idx(name) {
@@ -385,8 +397,7 @@ function parseMyFlightbook(lines) {
     const pic = getNum('pic');
     const night = getNum('night');
     const simInst = getNum('simulated instrument');
-    const imc = getNum('imc');
-    const xc = getNum('x-country');
+    const imc = getNum('imc');    const xc = getNum('x-country');
     const solo = getNum('solo time');
     const dayLdgs = parseInt(getNum('fs day landings')) || 0;
     const nightLdgs = parseInt(getNum('fs night landings')) || 0;
@@ -884,9 +895,7 @@ function renderFlightForm(initial) {
     blockTime = Math.round(blockTime * 10) / 10; // round to 1 decimal
 
     const isSim = data.duty_type === 'Simulator Duty';
-    const isInstr = ['Instructor (FI)','Instructor (TRI)','Examiner (TRE)','Examiner (DFE)','Training Captain','Check Captain'].includes(data.pilot_role);
-
-    if (isSim) {
+    const isInstr = ['Instructor (FI)','Instructor (TRI)','Examiner (TRE)','Examiner (DFE)','Training Captain','Check Captain'].includes(data.pilot_role);    if (isSim) {
       // Simulator duty: time goes to sim_time
       data.sim_time = blockTime;
       data.total_time = 0;
@@ -1185,8 +1194,7 @@ function render() {
 
   const totals = computeTotals(state.flights);
   const filtered = filteredFlights();
-  const byType = {};
-  state.flights.forEach(f => {
+  const byType = {};  state.flights.forEach(f => {
     const t = f.aircraft_type || 'Unknown';
     if (!byType[t]) byType[t] = {total:0,pic:0,dual:0,night:0,ldgs:0,n:0};
     byType[t].total += (f.total_time||0)+(f.sim_time||0);
@@ -1423,7 +1431,7 @@ function render() {
     ));
     const btnRow = div({style:{display:'flex',gap:'8px'}});
     btnRow.appendChild(btn({style:{background:'#006B3F',border:'none',color:'#FFB612',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>setState({showEndorseForm:true,editEndorse:null})},'+ Add'));
-    btnRow.appendChild(btn({style:{background:'#0066CC',border:'none',color:'#FFFFFF',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>setState({showAIScan:true})},'Scan Document (AI)'));
+    btnRow.appendChild(btn({style:{background:'#0066CC',border:'none',color:'#FFFFFF',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>setState({showAIScan:true})},'Scan Document (OCR)'));
     eh.appendChild(btnRow);
     main.appendChild(eh);
 
@@ -1484,9 +1492,7 @@ function render() {
     const xcPIC = state.flights.filter(f=>(f.xc||0)>0&&(f.pic||0)>0).reduce((a,f)=>a+Math.min(f.xc||0,f.pic||0),0);
     const nightPIC = state.flights.filter(f=>(f.night||0)>0&&(f.pic||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.pic||0),0);
     const nightLdgs = totals.night_ldgs||0;
-    const nightDual = state.flights.filter(f=>(f.night||0)>0&&(f.dual||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.dual||0),0);
-
-    function req(label, reg, current, reqVal, note, color='var(--sky)', unit='h') {
+    const nightDual = state.flights.filter(f=>(f.night||0)>0&&(f.dual||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.dual||0),0);    function req(label, reg, current, reqVal, note, color='var(--sky)', unit='h') {
       const done = current >= reqVal;
       const pct = Math.min(100,(current/reqVal)*100);
       const wrap = div({style:{marginBottom:'13px',paddingBottom:'13px',borderBottom:'1px solid var(--border)22'}});
@@ -1784,9 +1790,7 @@ function render() {
       )
     );
     main.appendChild(summary);
-  }
-
-  else if (state.tab === 'reports') {
+  }  else if (state.tab === 'reports') {
     const pdate = now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'});
     const rh = div({style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'14px',flexWrap:'wrap',gap:'10px'}});
     rh.appendChild(div({},
@@ -1990,7 +1994,7 @@ function render() {
   if (state.showAIScan) {
     const scanContent = div({});
     const scanInfo = div({style:{background:'#E8F0F8',border:'1px solid #0066CC33',borderRadius:'8px',padding:'12px 14px',marginBottom:'14px',fontSize:'12px',color:'#333',lineHeight:'1.7'}},
-      'Upload a photo or scan of your licence, medical certificate, OPC/LPC result, type rating or any other aviation endorsement document. The AI will read it and automatically fill in the endorsement details.'
+      'Upload a photo or scan of your licence, medical certificate, OPC/LPC result, type rating or any other aviation endorsement document. This reads the text on-device (no account, no cost) and tries to fill in the fields below — always double-check them before saving.'
     );
     scanContent.appendChild(scanInfo);
 
@@ -2011,82 +2015,99 @@ function render() {
     const scanResult = div({});
     scanContent.appendChild(scanResult);
 
+    // Best-effort field extraction from raw OCR text. Runs entirely on-device (no AI
+    // model, no API key, no billing) using keyword and pattern matching. Much less
+    // reliable than an AI model at telling fields apart, so everything here is meant
+    // to be reviewed and corrected below, not trusted blindly.
+    function extractFieldsFromText(text) {
+      const result = { category:'', title:'', aircraft_type:'', date_issued:'', expiry_date:'', instructor:'', licence_no:'', ca_form:'', remarks:'' };
+      if (!text) return result;
+
+      if (/medical/i.test(text)) result.category = 'Medical Certificate';
+      else if (/instrument rating|\bIR\b/i.test(text)) result.category = 'Instrument Rating';
+      else if (/type rating|class rating/i.test(text)) result.category = 'Type / Class Rating';
+      else if (/night rating/i.test(text)) result.category = 'Night Rating';
+      else if (/\bOPC\b|\bLPC\b|proficiency check/i.test(text)) result.category = 'OPC / LPC';
+      else if (/skills test/i.test(text)) result.category = 'Skills Test';
+      else if (/ground exam/i.test(text)) result.category = 'Ground Examination';
+      else if (/licen[cs]e|\bATPL\b|\bCPL\b|\bPPL\b/i.test(text)) result.category = 'PPL / Licence';
+
+      const dateRe = /\b\d{1,2}[\/\-. ][A-Za-z]{3,9}[\/\-. ]\d{2,4}\b|\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b|\b\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}\b/g;
+      const allDates = text.match(dateRe) || [];
+      if (allDates[0]) result.date_issued = allDates[0];
+      if (allDates[1]) result.expiry_date = allDates[1];
+
+      const issuedMatch = text.match(/(?:date of issue|issued|issue date)[:\s]*([0-9A-Za-z\/\-. ]{6,20})/i);
+      if (issuedMatch) result.date_issued = issuedMatch[1].trim();
+      const expiryMatch = text.match(/(?:expiry|expires|valid until|valid to)[:\s]*([0-9A-Za-z\/\-. ]{6,20})/i);
+      if (expiryMatch) result.expiry_date = expiryMatch[1].trim();
+
+      const licMatch = text.match(/(?:licen[cs]e no\.?|certificate no\.?|ref(?:erence)? no\.?)[:\s]*([A-Z0-9\-\/]{4,20})/i);
+      if (licMatch) result.licence_no = licMatch[1];
+
+      const acMatch = text.match(/\b([A-Z]{1,2}\d{2,3}[A-Z]?)\b/);
+      if (acMatch) result.aircraft_type = acMatch[1];
+
+      const nameMatch = text.match(/(?:examiner|instructor|signed by|\bAME\b)[:\s]*([A-Za-z][A-Za-z.\s]{3,40})/i);
+      if (nameMatch) result.instructor = nameMatch[1].trim();
+
+      const caMatch = text.match(/\bCA[\s\-]?\d{2}[\-.]?\d{2,3}(?:\.\d+)?(?:\([0-9a-z]\))?/i);
+      if (caMatch) result.ca_form = caMatch[0];
+
+      result.remarks = 'Auto-filled from on-device OCR — please check every field carefully before saving.';
+      return result;
+    }
+
     async function processDocScan(file) {
       scanZone.innerHTML = '';
       scanZone.style.background = '#E8F0F8';
-      scanZone.appendChild(div({style:{padding:'20px',textAlign:'center',color:'#0066CC',fontSize:'13px',fontWeight:'600'}},'Reading document with AI...'));
+      const progressLine = div({style:{padding:'20px',textAlign:'center',color:'#0066CC',fontSize:'13px',fontWeight:'600'}},'Reading document...');
+      scanZone.appendChild(progressLine);
 
       try {
-        // Convert file to base64
-        const base64 = await new Promise((res,rej)=>{
-          const reader = new FileReader();
-          reader.onload = ()=>res(reader.result.split(',')[1]);
-          reader.onerror = rej;
-          reader.readAsDataURL(file);
-        });
-
         const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-        const mediaType = isPDF ? 'application/pdf' : (file.type || 'image/jpeg');
+        let ocrSource = file;
 
-        const prompt = `You are reading an aviation document for a South African pilot logbook system (SACAA).
-Extract the following information from this document and return ONLY valid JSON, no other text:
-{
-  "category": "one of: PPL / Licence, Night Rating, Type / Class Rating, Instrument Rating, Medical Certificate, OPC / LPC, Skills Test, Ground Examination, Instructor Sign-off, Other",
-  "title": "brief descriptive title e.g. ATPL(A) Licence, Class 1 Medical Certificate, B737 Type Rating",
-  "aircraft_type": "ICAO aircraft type code if applicable e.g. B738, A320, leave empty for medical/licence",
-  "date_issued": "YYYY-MM-DD format",
-  "expiry_date": "YYYY-MM-DD format if found",
-  "instructor": "name of examiner, AME, or signing authority",
-  "licence_no": "licence number, medical ref number, or authority number",
-  "ca_form": "relevant SACAA CA form e.g. CA Med 1, CA 61-09.8",
-  "remarks": "any additional important details like licence type, ratings, conditions"
-}`;
-
-        const messageContent = isPDF
-          ? [{type:'document',source:{type:'base64',media_type:'application/pdf',data:base64}},{type:'text',text:prompt}]
-          : [{type:'image',source:{type:'base64',media_type:mediaType,data:base64}},{type:'text',text:prompt}];
-
-        // Calls a Supabase Edge Function (scan-document) instead of api.anthropic.com
-        // directly. The real Anthropic API key lives server-side as a Supabase secret,
-        // so it's never exposed in this public GitHub Pages page source.
-        const response = await fetch(SUPABASE_URL + '/functions/v1/scan-document',{
-          method:'POST',
-          headers:{
-            'Content-Type':'application/json',
-            'Authorization':'Bearer ' + SUPABASE_ANON_KEY
-          },
-          body:JSON.stringify({
-            model:'claude-sonnet-4-6',
-            max_tokens:1000,
-            messages:[{role:'user',content:messageContent}]
-          })
-        });
-
-        const data = await response.json();
-
-        // Check for API errors
-        if (data.error) {
-          throw new Error('API Error: ' + (data.error.message || JSON.stringify(data.error)));
-        }
-        if (!data.content || !data.content[0]) {
-          throw new Error('No response from AI. API response: ' + JSON.stringify(data).slice(0,200));
+        if (isPDF) {
+          if (!window.pdfjsLib) throw new Error('PDF reader failed to load. Try again, or convert the PDF to a photo/JPG first.');
+          const arrayBuffer = await file.arrayBuffer();
+          const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          const page = await pdf.getPage(1);
+          const viewport = page.getViewport({ scale: 2.5 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
+          await page.render({ canvasContext: ctx, viewport }).promise;
+          ocrSource = canvas;
         }
 
-        const text = data.content[0].text || '';
+        if (!window.Tesseract) throw new Error('OCR engine failed to load. Check your connection and try again.');
 
-        // Parse JSON from response
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-          throw new Error('AI response: ' + text.slice(0,300));
+        const { data } = await Tesseract.recognize(ocrSource, 'eng', {
+          logger: m => {
+            if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+              progressLine.textContent = 'Reading document... ' + Math.round(m.progress*100) + '%';
+            }
+          }        });
+        const rawText = (data && data.text || '').trim();
+        if (!rawText) {
+          throw new Error('Could not find any readable text on this document. Try a clearer photo, or add the endorsement manually.');
         }
-        const extracted = JSON.parse(jsonMatch[0]);
+
+        const extracted = extractFieldsFromText(rawText);
 
         // Show result and allow editing before saving
         scanResult.innerHTML = '';
-        const okBanner = div({style:{background:'#E8F5E9',border:'1px solid #A5D6A7',borderRadius:'7px',padding:'10px 14px',marginBottom:'12px',fontSize:'13px',color:'#2E7D32',fontWeight:'600'}},
-          'Document read successfully! Review the details below and save.'
+        const okBanner = div({style:{background:'#FFF8E1',border:'1px solid #FFE082',borderRadius:'7px',padding:'10px 14px',marginBottom:'12px',fontSize:'13px',color:'#8D6E00',fontWeight:'600'}},
+          'Text read from document. This is on-device OCR, not AI — check every field below carefully before saving.'
         );
         scanResult.appendChild(okBanner);
+
+        const rawDetails = el('details',{style:{marginBottom:'12px'}});
+        rawDetails.appendChild(el('summary',{style:{fontSize:'12px',color:'#0066CC',cursor:'pointer',fontWeight:'600'}},'Show raw text read from document'));
+        rawDetails.appendChild(el('pre',{style:{whiteSpace:'pre-wrap',fontSize:'11px',color:'#555',background:'#F8F9FA',border:'1px solid #DEE2E6',borderRadius:'7px',padding:'10px',marginTop:'8px',maxHeight:'150px',overflowY:'auto'}},rawText));
+        scanResult.appendChild(rawDetails);
 
         // Show extracted fields
         const fields = div({style:{background:'#F8F9FA',borderRadius:'8px',padding:'12px',marginBottom:'12px',border:'1px solid #DEE2E6'}});
@@ -2154,7 +2175,7 @@ Extract the following information from this document and return ONLY valid JSON,
       }
     }
 
-    app.appendChild(modal('Scan Document - AI Extraction', scanContent, ()=>setState({showAIScan:false}), true));
+    app.appendChild(modal('Scan Document - OCR Auto-fill', scanContent, ()=>setState({showAIScan:false}), true));
   }
 
   if (state.showEndorseForm) {
