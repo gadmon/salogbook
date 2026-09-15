@@ -288,12 +288,17 @@ async function deleteFlight(id) {
 
 async function saveEndorsement(data) {
   const uid = state.session.user.id;
-  if (data.id) {
-    const { error } = await sb.from('endorsements').update({...data, updated_at: new Date().toISOString()}).eq('id', data.id);
+  // Postgres `date` columns reject '' (only accept a real date or NULL) - blank
+  // date fields (e.g. an endorsement with no expiry, or a submitted_date that
+  // was never set) must be sent as null, not empty string, or the save fails
+  // with "invalid input syntax for type date".
+  const payload = {...data};
+  ['date_issued','expiry_date','submitted_date'].forEach(k => { if (payload[k] === '') payload[k] = null; });
+  if (payload.id) {
+    const { error } = await sb.from('endorsements').update({...payload, updated_at: new Date().toISOString()}).eq('id', payload.id);
     if (error) throw error;
-    state.endorsements = state.endorsements.map(e => e.id === data.id ? {...e, ...data} : e);
-  } else {
-    const { data: ins, error } = await sb.from('endorsements').insert({...data, pilot_id: uid}).select().single();
+    state.endorsements = state.endorsements.map(e => e.id === payload.id ? {...e, ...payload} : e);  } else {
+    const { data: ins, error } = await sb.from('endorsements').insert({...payload, pilot_id: uid}).select().single();
     if (error) throw error;
     state.endorsements = [ins, ...state.endorsements];
   }
@@ -397,7 +402,8 @@ function parseMyFlightbook(lines) {
     const pic = getNum('pic');
     const night = getNum('night');
     const simInst = getNum('simulated instrument');
-    const imc = getNum('imc');    const xc = getNum('x-country');
+    const imc = getNum('imc');
+    const xc = getNum('x-country');
     const solo = getNum('solo time');
     const dayLdgs = parseInt(getNum('fs day landings')) || 0;
     const nightLdgs = parseInt(getNum('fs night landings')) || 0;
@@ -590,9 +596,7 @@ async function importEntries(entries) {
   }
   state.flights.sort((a,b) => b.date.localeCompare(a.date));
   return imported;
-}
-
-// ─── DOCUMENT UPLOAD ──────────────────────────────────────────────────────────
+}// ─── DOCUMENT UPLOAD ──────────────────────────────────────────────────────────
 async function uploadDocument(file, docType, notes) {
   const uid = state.session.user.id;
   const path = `${uid}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g,'_')}`;
@@ -890,12 +894,13 @@ function renderFlightForm(initial) {
     if (off === null || on === null) return;
 
     // Handle midnight crossing (e.g. 22:00 off, 02:30 on)
-    let blockTime = on - off;
-    if (blockTime < 0) blockTime += 24;
+    let blockTime = on - off;    if (blockTime < 0) blockTime += 24;
     blockTime = Math.round(blockTime * 10) / 10; // round to 1 decimal
 
     const isSim = data.duty_type === 'Simulator Duty';
-    const isInstr = ['Instructor (FI)','Instructor (TRI)','Examiner (TRE)','Examiner (DFE)','Training Captain','Check Captain'].includes(data.pilot_role);    if (isSim) {
+    const isInstr = ['Instructor (FI)','Instructor (TRI)','Examiner (TRE)','Examiner (DFE)','Training Captain','Check Captain'].includes(data.pilot_role);
+
+    if (isSim) {
       // Simulator duty: time goes to sim_time
       data.sim_time = blockTime;
       data.total_time = 0;
@@ -1188,13 +1193,12 @@ function render() {
     ld.appendChild(div({style:{color:'var(--steel)',fontFamily:'monospace',fontSize:'12px'}},'Loading...'));
     app.appendChild(ld);
     return;
-  }
-
-  if (!state.session) { app.appendChild(renderAuth()); return; }
+  }  if (!state.session) { app.appendChild(renderAuth()); return; }
 
   const totals = computeTotals(state.flights);
   const filtered = filteredFlights();
-  const byType = {};  state.flights.forEach(f => {
+  const byType = {};
+  state.flights.forEach(f => {
     const t = f.aircraft_type || 'Unknown';
     if (!byType[t]) byType[t] = {total:0,pic:0,dual:0,night:0,ldgs:0,n:0};
     byType[t].total += (f.total_time||0)+(f.sim_time||0);
@@ -1486,13 +1490,13 @@ function render() {
     main.appendChild(div({style:{marginBottom:'14px'}},
       div({style:{fontSize:'18px',fontWeight:'800',color:'var(--text)'}},'Training Progress'),
       div({style:{fontSize:'12px',color:'var(--steel)',marginTop:'3px'}},'SACAA CAR Part 61 and SA-CATS 61 requirements')
-    ));
-
-    const totalInst = (totals.ifr||0)+(totals.sim_inst||0);
+    ));    const totalInst = (totals.ifr||0)+(totals.sim_inst||0);
     const xcPIC = state.flights.filter(f=>(f.xc||0)>0&&(f.pic||0)>0).reduce((a,f)=>a+Math.min(f.xc||0,f.pic||0),0);
     const nightPIC = state.flights.filter(f=>(f.night||0)>0&&(f.pic||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.pic||0),0);
     const nightLdgs = totals.night_ldgs||0;
-    const nightDual = state.flights.filter(f=>(f.night||0)>0&&(f.dual||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.dual||0),0);    function req(label, reg, current, reqVal, note, color='var(--sky)', unit='h') {
+    const nightDual = state.flights.filter(f=>(f.night||0)>0&&(f.dual||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.dual||0),0);
+
+    function req(label, reg, current, reqVal, note, color='var(--sky)', unit='h') {
       const done = current >= reqVal;
       const pct = Math.min(100,(current/reqVal)*100);
       const wrap = div({style:{marginBottom:'13px',paddingBottom:'13px',borderBottom:'1px solid var(--border)22'}});
@@ -1785,12 +1789,13 @@ function render() {
           div({style:{background:ok?'#E8F5E9':'#FFEBEE',border:'1px solid '+(ok?'#A5D6A7':'#FFCDD2'),borderRadius:'6px',padding:'7px 11px',textAlign:'center',minWidth:'65px'}},
             div({style:{fontSize:'9px',color:'#555',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:'3px'}},label),
             div({style:{fontFamily:'monospace',fontWeight:'800',fontSize:'13px',color:ok?'#2E7D32':'#C62828'}},val)
-          )
-        )
+          )        )
       )
     );
     main.appendChild(summary);
-  }  else if (state.tab === 'reports') {
+  }
+
+  else if (state.tab === 'reports') {
     const pdate = now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'});
     const rh = div({style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'14px',flexWrap:'wrap',gap:'10px'}});
     rh.appendChild(div({},
@@ -2019,6 +2024,44 @@ function render() {
     // model, no API key, no billing) using keyword and pattern matching. Much less
     // reliable than an AI model at telling fields apart, so everything here is meant
     // to be reviewed and corrected below, not trusted blindly.
+    // Converts a loosely-formatted date string (as read off a document) into the
+    // strict ISO "YYYY-MM-DD" that the <input type="date"> fields and the
+    // Postgres `date` columns require. Returns '' if it can't be parsed with
+    // confidence — an empty field is safer than one that fails to save.
+    function normalizeDateStr(s) {
+      if (!s) return '';
+      s = String(s).trim().replace(/\s+/g,' ');
+
+      // Already ISO-ish: YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+      let m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/);
+      if (m) {
+        const [, y, mo, d] = m;
+        if (+mo>=1 && +mo<=12 && +d>=1 && +d<=31) return y+'-'+String(mo).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+      }
+
+      // DD Month YYYY (month name, e.g. "30 September 2025" / "30-Sep-2025")
+      const months = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12};
+      m = s.match(/^(\d{1,2})[\/\-. ]([A-Za-z]{3,9})[\/\-. ](\d{2,4})$/);
+      if (m) {
+        const mo = months[m[2].slice(0,3).toLowerCase()];
+        let y = m[3]; if (y.length===2) y = (+y<50?'20':'19')+y;
+        const d = m[1];
+        if (mo && +d>=1 && +d<=31) return y+'-'+String(mo).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+      }
+
+      // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY (day-first, standard on SA/ICAO documents)
+      m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+      if (m) {
+        let [, a, b, y] = m;
+        if (y.length===2) y = (+y<50?'20':'19')+y;
+        let day = +a, mon = +b;
+        if (mon > 12 && day <= 12) { const t=day; day=mon; mon=t; } // swap if only valid the other way round
+        if (mon>=1 && mon<=12 && day>=1 && day<=31) return y+'-'+String(mon).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+      }
+
+      return ''; // not confident enough to guess - leave blank for manual entry
+    }
+
     function extractFieldsFromText(text) {
       const result = { category:'', title:'', aircraft_type:'', date_issued:'', expiry_date:'', instructor:'', licence_no:'', ca_form:'', remarks:'' };
       if (!text) return result;
@@ -2041,6 +2084,12 @@ function render() {
       if (issuedMatch) result.date_issued = issuedMatch[1].trim();
       const expiryMatch = text.match(/(?:expiry|expires|valid until|valid to)[:\s]*([0-9A-Za-z\/\-. ]{6,20})/i);
       if (expiryMatch) result.expiry_date = expiryMatch[1].trim();
+
+      // Normalize whatever we found into strict ISO format (YYYY-MM-DD) so it
+      // actually lands correctly in the date-picker fields and saves cleanly.
+      // If a match can't be parsed with confidence, leave it blank rather than
+      // pass through a raw string that would fail to save.      result.date_issued = normalizeDateStr(result.date_issued);
+      result.expiry_date = normalizeDateStr(result.expiry_date);
 
       const licMatch = text.match(/(?:licen[cs]e no\.?|certificate no\.?|ref(?:erence)? no\.?)[:\s]*([A-Z0-9\-\/]{4,20})/i);
       if (licMatch) result.licence_no = licMatch[1];
@@ -2089,7 +2138,8 @@ function render() {
             if (m.status === 'recognizing text' && typeof m.progress === 'number') {
               progressLine.textContent = 'Reading document... ' + Math.round(m.progress*100) + '%';
             }
-          }        });
+          }
+        });
         const rawText = (data && data.text || '').trim();
         if (!rawText) {
           throw new Error('Could not find any readable text on this document. Try a clearer photo, or add the endorsement manually.');
@@ -2124,7 +2174,6 @@ function render() {
           onclick:()=>{
             // Open endorsement form pre-filled with extracted data
             setState({showAIScan:false, showEndorseForm:true, editEndorse:{
-              id:'new_'+Date.now(),
               category: extracted.category || 'Other',
               title: extracted.title || '',
               aircraft_type: extracted.aircraft_type || '',
@@ -2141,7 +2190,6 @@ function render() {
           onclick:async()=>{
             try {
               await saveEndorsement({
-                id:'new_'+Date.now(),
                 category: extracted.category || 'Other',
                 title: extracted.title || '',
                 aircraft_type: extracted.aircraft_type || '',
@@ -2339,9 +2387,7 @@ async function idbClear(store) {
     tx.oncomplete = resolve;
     tx.onerror = resolve;
   });
-}
-
-async function idbQueueAdd(item) {
+}async function idbQueueAdd(item) {
   const db = await openIDB();
   return new Promise((resolve) => {
     const tx = db.transaction('queue', 'readwrite');
