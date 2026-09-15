@@ -2088,7 +2088,8 @@ function render() {
       // Normalize whatever we found into strict ISO format (YYYY-MM-DD) so it
       // actually lands correctly in the date-picker fields and saves cleanly.
       // If a match can't be parsed with confidence, leave it blank rather than
-      // pass through a raw string that would fail to save.      result.date_issued = normalizeDateStr(result.date_issued);
+      // pass through a raw string that would fail to save.
+      result.date_issued = normalizeDateStr(result.date_issued);
       result.expiry_date = normalizeDateStr(result.expiry_date);
 
       const licMatch = text.match(/(?:licen[cs]e no\.?|certificate no\.?|ref(?:erence)? no\.?)[:\s]*([A-Z0-9\-\/]{4,20})/i);
