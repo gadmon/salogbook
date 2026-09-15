@@ -1,5 +1,5 @@
-// SALOGBOOK Service Worker v2
-const CACHE_NAME = 'salogbook-v2';
+// SALOGBOOK Service Worker v3
+const CACHE_NAME = 'salogbook-v3';
 
 // Install - cache the app shell
 self.addEventListener('install', event => {
@@ -35,17 +35,21 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // For the app itself - cache first, network fallback
+  // For the app itself - network first, so a new deploy is picked up on the very
+  // next load, with the cached copy only used as an offline fallback. (Previously
+  // this was cache-first, which meant a browser that had ever loaded the app kept
+  // serving its first-ever cached index.html forever, even across new deployments -
+  // that's why fixes shipped to the repo didn't reach users who'd already visited.)
   event.respondWith(
-    caches.match(event.request).then(cached => {
-      if (cached) return cached;
-      return fetch(event.request).then(response => {
-        if (response.ok && event.request.mode === 'navigate') {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
-        }
-        return response;
-      }).catch(() => {
+    fetch(event.request).then(response => {
+      if (response.ok && event.request.mode === 'navigate') {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+      }
+      return response;
+    }).catch(() => {
+      return caches.match(event.request).then(cached => {
+        if (cached) return cached;
         if (event.request.mode === 'navigate') {
           return caches.match('/salogbook/index.html');
         }
