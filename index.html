@@ -1608,8 +1608,7 @@ function render() {
     const last90 = state.flights.filter(f => new Date(f.date) >= cut90);
 
     // Movements in last 90 days
-    // SA-CAR 61.01.8(1): day OR night T/O and landings count for DAY recency
-    // SA-CAR 61.01.8(2): only NIGHT T/O and landings count for NIGHT recency
+    // Part 121 operations: 3 takeoffs and landings in preceding 90 days, day or night combined - no separate night-only requirement
     const dayTO90_only   = last90.reduce((a,f)=>a+(f.day_takeoffs||0),0);
     const nightTO90 = last90.reduce((a,f)=>a+(f.night_takeoffs||0),0);
     const dayLdg90_only  = last90.reduce((a,f)=>a+(f.day_landings||0),0);
@@ -1686,11 +1685,9 @@ function render() {
     ));
 
     // Day/Night T/O and Landings
-    main.appendChild(section('Day & Night Takeoffs and Landings','SA-CAR 61.01.8(1)(2) - Required in preceding 90 days','#0066CC',[
-      rItem('Takeoffs for Day Recency','CAR 61.01.8(1)(a)',dayTO90,3,'','Day + Night takeoffs combined. Minimum 3 in preceding 90 days to carry passengers by day ('+dayTO90_only+' day + '+nightTO90+' night = '+dayTO90+' total)',dayTO90>=3),
-      rItem('Landings for Day Recency','CAR 61.01.8(1)(b)',dayLdg90,3,'','Day + Night landings combined. Minimum 3 in preceding 90 days to carry passengers by day ('+dayLdg90_only+' day + '+nightLdg90+' night = '+dayLdg90+' total)',dayLdg90>=3),
-      rItem('Night Takeoffs Only','CAR 61.01.8(2)(a)',nightTO90,3,'','Night takeoffs ONLY count for night recency. Minimum 3 in preceding 90 days to carry passengers at night',nightTO90>=3),
-      rItem('Night Landings Only (full stop)','CAR 61.01.8(2)(b)',nightLdg90,3,'','Night full-stop landings ONLY. Minimum 3 in preceding 90 days to carry passengers at night',nightLdg90>=3),
+    main.appendChild(section('Takeoffs and Landings','Part 121 Operations - Required in preceding 90 days','#0066CC',[
+      rItem('Takeoffs','',dayTO90,3,'','Minimum 3 takeoffs in preceding 90 days, day or night combined',dayTO90>=3),
+      rItem('Landings','',dayLdg90,3,'','Minimum 3 landings in preceding 90 days, day or night combined',dayLdg90>=3),
     ]));
 
     // Instrument Approaches
@@ -1808,8 +1805,7 @@ function render() {
 
     // Summary strip
     const summaryItems = [
-      ['Day TO',dayTO90>=3,dayTO90+'/3'],['Day Ldg',dayLdg90>=3,dayLdg90+'/3'],
-      ['Night TO',nightTO90>=3,nightTO90+'/3'],['Night Ldg',nightLdg90>=3,nightLdg90+'/3'],
+      ['Takeoffs',dayTO90>=3,dayTO90+'/3'],['Landings',dayLdg90>=3,dayLdg90+'/3'],
       ['Inst Apch',instrApch.length>=2,instrApch.length+'/2'],
       ['2D Apch',apch2D>=1,apch2D+'/1'],['3D Apch',apch3D>=1,apch3D+'/1'],
       ['OPC/LPC',opcOk,opcOk?'VALID':'CHECK'],['Medical',medOk,medOk?'VALID':'CHECK'],
