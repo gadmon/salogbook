@@ -11,7 +11,7 @@
   <title>SALOGBOOK - Springbok Aviation Logbook</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23006B3F'/><text y='.9em' font-size='65' x='10'>SB</text></svg>"/>
   <style>
-    *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+    *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent
     :root{
       --bg:#F8F9FA;--surf:#FFFFFF;--card:#FFFFFF;--border:#DEE2E6;
       --green:#006B3F;--gold:#B8860B;--red:#DC3545;--blue:#0066CC;
@@ -828,7 +828,10 @@ function renderFlightForm(initial) {
     day_landings:0, night_landings:0, day_takeoffs:0, night_takeoffs:0, holds:0,
     chocks_off:'', chocks_on:'',
     pilot_role:'Dual (Student)', duty_role:'', p1_name:'', p2_name:'', instructor:'',
-    lesson:'', remarks:'', approaches:[]
+    lesson:'', remarks:'', approaches:[],
+    flight_number:'', actual_inst:0, p1us:0, p1us_night:0, dual_given:0, relief:0,
+    relief_crew_name:'', sfi_sfe:0, on_duty:'', off_duty:'', pilot_flying:false,
+    check_captain_name:'', autolands:0, catii:0, catiii:0, rnav_approaches:0, ils_approaches:0
   };
 
   const data = {...f};
@@ -869,6 +872,12 @@ function renderFlightForm(initial) {
   form.appendChild(row(
     fld('Aircraft Type', mkInp('aircraft_type','text','B738')),
     fld('Registration', mkInp('aircraft_reg','text','ZS-OHH'))
+  ));
+  form.appendChild(row(
+    fld('Flight Number', mkInp('flight_number','text','SA281'),'1 0 110px'),
+    fld('On Duty (Zulu)', mkInp('on_duty','text','HH:MM'),'1 0 100px'),
+    fld('Off Duty (Zulu)', mkInp('off_duty','text','HH:MM'),'1 0 100px'),
+    (() => { const w = div({style:{flex:'0 0 110px',display:'flex',alignItems:'center',gap:'6px',paddingTop:'18px'}}); const c = inp({type:'checkbox',style:{width:'16px',height:'16px',accentColor:'var(--green)',cursor:'pointer'}}); c.checked = !!data.pilot_flying; c.onchange = e => { data.pilot_flying = e.target.checked; }; w.appendChild(c); w.appendChild(span({style:{fontSize:'11px',color:'var(--steel)'}},'Pilot Flying')); return w; })()
   ));
 
   const isSim = data.duty_type === 'Simulator Duty';
@@ -976,7 +985,7 @@ function renderFlightForm(initial) {
   form.appendChild(row(
     fld('Total Flight', totalInp,'1 0 70px'),
     fld('Sim Time', simInp,'1 0 70px'),
-    fld('SFI / Sim Inst', simInstInp,'1 0 70px'),
+    fld('Sim Inst', simInstInp,'1 0 70px'),
     fld('PIC', mkInp('pic','number','0.0'),'1 0 70px'),
     fld('SIC', mkInp('sic','number','0.0'),'1 0 70px'),
     fld('PICUS', mkInp('picus','number','0.0'),'1 0 70px'),
@@ -984,6 +993,16 @@ function renderFlightForm(initial) {
     fld('Night', mkInp('night','number','0.0'),'1 0 70px'),
     fld('Actual IFR', mkInp('ifr','number','0.0'),'1 0 70px'),
     fld('X-Country', mkInp('xc','number','0.0'),'1 0 70px')
+  ));
+  const extraTimeLabel = div({style:{fontSize:'9px',color:'#0066CC',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Additional Time (LogTenPro fields)');
+  form.appendChild(extraTimeLabel);
+  form.appendChild(row(
+    fld('Actual Inst', mkInp('actual_inst','number','0.0'),'1 0 80px'),
+    fld('P1 U/S', mkInp('p1us','number','0.0'),'1 0 80px'),
+    fld('P1 U/S Night', mkInp('p1us_night','number','0.0'),'1 0 80px'),
+    fld('Dual Given', mkInp('dual_given','number','0.0'),'1 0 80px'),
+    fld('Relief', mkInp('relief','number','0.0'),'1 0 80px'),
+    fld('SFI / SFE', mkInp('sfi_sfe','number','0.0'),'1 0 80px')
   ));
 
   // Movements
@@ -995,6 +1014,15 @@ function renderFlightForm(initial) {
     fld('Night T/O', mkInp('night_takeoffs','number','0'),'1 0 60px'),
     fld('Night Ldgs', mkInp('night_landings','number','0'),'1 0 60px'),
     fld('Holds', mkInp('holds','number','0'),'1 0 55px')
+  ));
+  const apchCountLabel = div({style:{fontSize:'9px',color:'var(--teal)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Approach Counts (LogTenPro summary totals)');
+  form.appendChild(apchCountLabel);
+  form.appendChild(row(
+    fld('Autolands', mkInp('autolands','number','0'),'1 0 70px'),
+    fld('CAT II', mkInp('catii','number','0'),'1 0 60px'),
+    fld('CAT III', mkInp('catiii','number','0'),'1 0 60px'),
+    fld('RNAV', mkInp('rnav_approaches','number','0'),'1 0 60px'),
+    fld('ILS', mkInp('ils_approaches','number','0'),'1 0 60px')
   ));
   form.appendChild(row(
     fld('Pilot Role', (() => { const s = sel({style:{...si,cursor:'pointer'},onchange:e=>{data['pilot_role']=e.target.value;calcFromChocks();}}); [['PIC','PIC'],['SIC','SIC'],['PICUS','PICUS'],['Dual (Student)','Dual (Student)'],['PIC (Solo)','PIC (Solo)'],['Student / Trainee','Student / Trainee'],['Check Captain','Check Captain'],['Training Captain','Training Captain'],['Instructor (FI)','Instructor (FI)'],['Instructor (TRI)','Instructor (TRI)'],['Examiner (TRE)','Examiner (TRE)'],['Examiner (DFE)','Examiner (DFE)'],['Safety Pilot','Safety Pilot'],['Observer','Observer']].forEach(([v,t])=>s.appendChild(opt(v,t,data['pilot_role']===v))); return s; })(),'2 0 150px'),
@@ -1008,6 +1036,10 @@ function renderFlightForm(initial) {
     fld('P1 (Captain)', mkInp('p1_name','text','Name')),
     fld('P2 (Co-Pilot)', mkInp('p2_name','text','Name')),
     fld('Instructor', mkInp('instructor','text','Name'))
+  ));
+  form.appendChild(row(
+    fld('Relief Crew', mkInp('relief_crew_name','text','Name')),
+    fld('Check Captain', mkInp('check_captain_name','text','Name'))
   ));
 
   // Approaches
