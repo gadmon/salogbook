@@ -474,11 +474,15 @@ function parseMyFlightbook(lines) {
 }
 
 function parseTabDelimited(lines) {
+  // Column names below match LogTenPro's TSV export headers exactly (normalized to
+  // lowercase with spaces/slashes collapsed to underscores), tried first for an exact
+  // match before falling back to a fuzzy substring match for other export formats.
   const headers = lines[0].split('\t').map(h => h.trim().toLowerCase().replace(/[\s\/]+/g, '_'));
 
   const get = (row, ...names) => {
     for (const n of names) {
-      const i = headers.findIndex(h => h.includes(n));
+      let i = headers.indexOf(n);
+      if (i < 0) i = headers.findIndex(h => h.includes(n));
       if (i >= 0 && row[i]) return row[i].trim();
     }
     return '';
@@ -492,6 +496,10 @@ function parseTabDelimited(lines) {
       return parseInt(parts[0]) + parseInt(parts[1] || 0) / 60;
     }
     return parseFloat(v) || 0;
+  };
+  const getBool = (row, ...names) => {
+    const v = get(row, ...names).toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'x';
   };
 
   const entries = [];
@@ -509,74 +517,101 @@ function parseTabDelimited(lines) {
       date = dateRaw.slice(0, 10);
     }
 
-    const totalTime = getHHMM(row, 'flight_time', 'total_time', 'total', 'block');
-    const simTime = getHHMM(row, 'sim', 'simulator', 'ground');
+    const totalTime = getHHMM(row, 'total_time', 'flight_time', 'total', 'block');
+    const simTime = getHHMM(row, 'simulator', 'sim', 'ground');
     if (totalTime === 0 && simTime === 0) continue;
+    // LogTenPro exports legacy "carry-forward" aggregate rows with implausible totals - skip them
+    if (totalTime > 24) continue;
 
-    const approaches = [];
-    const apchCount = getNum(row, 'approaches', 'approach');
-    if (apchCount > 0) {
-      const arr = get(row, 'to', 'arrival', 'destination');
-      for (let j = 0; j < Math.min(apchCount, 5); j++) {
-        approaches.push({ type: 'ILS Cat I', rwy: '', airport: arr, result: 'Full Stop' });
-      }
+    const picHours = getHHMM(row, 'pic', 'pilot_in_command');
+    const dualRcvdHours = getHHMM(row, 'dual_rcvd', 'dual_received', 'dual');
+    const checkCaptainName = get(row, 'check_captain');
+    const instructorName = get(row, 'instructor', 'instructor_name');
+
+    // PIC/SIC assignment: if this flight's own Check Captain or Instructor field is
+    // filled, the pilot was acting in that capacity (LogTenPro often leaves the PIC
+    // column blank for instructing/checking flights) - credit the time as PIC.
+    let pilot_role, picValue = picHours;
+    if (checkCaptainName) {
+      pilot_role = 'Check Captain';
+      if (picValue === 0) picValue = totalTime;
+    } else if (instructorName) {
+      pilot_role = 'Training Captain';
+      if (picValue === 0) picValue = totalTime;
+    } else if (picHours > 0) {
+      pilot_role = 'PIC';
+    } else if (dualRcvdHours > 0) {
+      pilot_role = 'Dual (Student)';
+    } else {
+      pilot_role = 'SIC';
     }
+
+    const apchList = [];
+    const apch1 = get(row, 'approach_1');
+    const apch2 = get(row, 'approach_2');
+    [apch1, apch2].forEach(a => {
+      if (!a) return;
+      const parts = a.split(';');
+      if (parts.length >= 2) {
+        let type = parts[1] || 'ILS';
+        if (type === '- NON-PRECISION -') type = '2D (Non-Precision)';
+        if (type === '- PRECISION -') type = '3D (Precision)';
+        apchList.push({ type, rwy: parts[0] || '', airport: parts[2] || '', result: 'Full Stop' });
+      }
+    });
 
     entries.push({
       pilot_id: state.session.user.id,
       date, source: 'logten',
       duty_type: simTime > 0 && totalTime === 0 ? 'Simulator Duty' : 'Flight Duty',
-      flight_rules: getNum(row, 'actual_instrument', 'imc') > 0 ? 'IFR' : 'VFR',
+      flight_rules: getNum(row, 'actual_inst', 'imc') > 0 ? 'IFR' : 'VFR',
+      flight_number: get(row, 'flight_#', 'flight_no', 'flight_number'),
       aircraft_type: get(row, 'aircraft_type', 'type', 'model', 'icao'),
-      aircraft_reg: get(row, 'registration', 'tail', 'reg'),
+      aircraft_reg: get(row, 'aircraft_id', 'registration', 'tail', 'reg'),
       dep_airport: get(row, 'from', 'departure', 'origin'),
       arr_airport: get(row, 'to', 'arrival', 'destination'),
       route: get(row, 'route'),
+      chocks_off: get(row, 'out', 'off'),
+      chocks_on: get(row, 'in'),
+      on_duty: get(row, 'on_duty'),
+      off_duty: get(row, 'off_duty'),
       total_time: totalTime,
       sim_time: simTime,
-      pic: getHHMM(row, 'pic', 'pilot_in_command'),
-      sic: getHHMM(row, 'sic', 'second_in_command', 'co_pilot'),
-      picus: getHHMM(row, 'p1u', 'picus', 'pic_us'),
-      dual: getHHMM(row, 'dual', 'dual_received'),
-      solo: getHHMM(row, 'solo'),
       night: getHHMM(row, 'night'),
-      ifr: getHHMM(row, 'actual_inst', 'imc', 'ifr'),
-      sim_inst: getHHMM(row, 'simulated_instrument', 'sim_inst'),
+      actual_inst: getHHMM(row, 'actual_inst'),
+      ifr: getHHMM(row, 'ifr'),
+      sim_inst: getHHMM(row, 'sim_inst', 'simulated_instrument'),
       xc: getHHMM(row, 'xc', 'cross_country', 'x_country'),
-      day_landings: parseInt(getNum(row, 'day_ldg', 'day_landing', 'full_stop_day')) || 0,
-      night_landings: parseInt(getNum(row, 'night_ldg', 'night_landing', 'full_stop_night')) || 0,
+      pic: picValue,
+      sic: getHHMM(row, 'sic', 'second_in_command', 'co_pilot'),
+      picus: getHHMM(row, 'picus', 'pic_us'),
+      dual: dualRcvdHours,
+      dual_given: getHHMM(row, 'dual_given'),
+      solo: getHHMM(row, 'solo'),
+      p1us: getHHMM(row, 'p1u_s'),
+      p1us_night: getHHMM(row, 'p1u_s_night'),
+      relief: getHHMM(row, 'relief'),
+      sfi_sfe: getHHMM(row, 'sfi_sfe'),
+      pilot_flying: getBool(row, 'pilot_flying'),
+      p1_name: get(row, 'pic_p1_crew', 'pic_name', 'captain', 'p1'),
+      p2_name: get(row, 'sic_p2_crew', 'co_pilot_name', 'sic_name', 'p2'),
+      relief_crew_name: get(row, 'relief_crew'),
+      instructor: instructorName,
+      check_captain_name: checkCaptainName,
+      pilot_role,
+      day_takeoffs: parseInt(getNum(row, 'day_t_o', 'day_to')) || 0,
+      night_takeoffs: parseInt(getNum(row, 'night_t_o', 'night_to')) || 0,
+      day_landings: parseInt(getNum(row, 'day_ldg')) || 0,
+      night_landings: parseInt(getNum(row, 'night_ldg')) || 0,
+      autolands: parseInt(getNum(row, 'autolands')) || 0,
+      catii: parseInt(getNum(row, 'catii')) || 0,
+      catiii: parseInt(getNum(row, 'catiii')) || 0,
+      rnav_approaches: parseInt(getNum(row, 'rnav')) || 0,
+      ils_approaches: parseInt(getNum(row, 'ils')) || 0,
       holds: parseInt(getNum(row, 'holds', 'holding')) || 0,
-      approaches: approaches,
-      pilot_role: getNum(row, 'pic') > 0 ? 'PIC' : getNum(row, 'dual') > 0 ? 'Dual (Student)' : 'SIC',
-      p1_name: get(row, 'pic_name', 'captain', 'p1'),
-      p2_name: get(row, 'co_pilot_name', 'sic_name', 'p2'),
-      instructor: get(row, 'instructor', 'instructor_name'),
       lesson: get(row, 'lesson', 'exercise', 'topic'),
       remarks: get(row, 'remarks', 'comments', 'notes'),
-      day_takeoffs: parseInt(getNum(row, 'day_t', 'day t')) || 0,
-      night_takeoffs: parseInt(getNum(row, 'night_t', 'night t')) || 0,
-      day_landings: parseInt(getNum(row, 'day_ldg', 'day l')) || 0,
-      night_landings: parseInt(getNum(row, 'night_ldg', 'night l')) || 0,
-      chocks_off: get(row, 'out') || get(row, 'off'),
-      chocks_on: get(row, 'in'),
-      approaches: (function() {
-        var apchList = [];
-        var apch1 = get(row, 'approach_1', 'approach 1');
-        var apch2 = get(row, 'approach_2', 'approach 2');
-        [apch1, apch2].forEach(function(a) {
-          if (!a) return;
-          var parts = a.split(';');
-          if (parts.length >= 2) {
-            var rwy = parts[0] || '';
-            var type = parts[1] || 'ILS';
-            var apt = parts[2] || '';
-            if (type === '- NON-PRECISION -') type = '2D (Non-Precision)';
-            if (type === '- PRECISION -') type = '3D (Precision)';
-            apchList.push({type: type, rwy: rwy, airport: apt, result: 'Full Stop'});
-          }
-        });
-        return apchList;
-      })(),
+      approaches: apchList,
     });
   }
   return entries;
