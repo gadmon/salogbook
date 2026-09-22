@@ -635,6 +635,8 @@ function computeTotals(flights) {
     a.total += (e.total_time||0)+(e.sim_time||0);
     a.flight += (e.total_time||0);
     a.sim += (e.sim_time||0);
+    a.sfi_sfe += (e.sfi_sfe||0);
+    a.sim_student += Math.max(0,(e.sim_time||0)-(e.sfi_sfe||0));
     a.pic += (e.pic||0);
     a.picus += (e.picus||0);
     a.sic += (e.sic||0);
@@ -648,7 +650,7 @@ function computeTotals(flights) {
     a.night_ldgs += (e.night_landings||0);
     a.approaches += (e.approaches||[]).length;
     return a;
-  }, {total:0,flight:0,sim:0,pic:0,picus:0,sic:0,dual:0,solo:0,night:0,ifr:0,sim_inst:0,xc:0,day_ldgs:0,night_ldgs:0,approaches:0});
+  }, {total:0,flight:0,sim:0,sfi_sfe:0,sim_student:0,pic:0,picus:0,sic:0,dual:0,solo:0,night:0,ifr:0,sim_inst:0,xc:0,day_ldgs:0,night_ldgs:0,approaches:0});
 }
 
 function filteredFlights() {
@@ -914,13 +916,17 @@ function renderFlightForm(initial) {
       data.sim_time = blockTime;
       data.total_time = 0;
       if (isInstr) {
-        // Instructing in sim: also record as sim_inst (SFI hours)
-        data.sim_inst = blockTime;
+        // Instructing/examining in sim: record as SFI/SFE hours (kept separate
+        // from sim_inst, which tracks instrument time flown in the sim)
+        data.sfi_sfe = blockTime;
+      } else {
+        data.sfi_sfe = 0;
       }
     } else {
       // Flight duty: time goes to total_time
       data.total_time = blockTime;
       data.sim_time = 0;
+      data.sfi_sfe = 0;
     }
 
     // Update the displayed time inputs
@@ -932,6 +938,7 @@ function renderFlightForm(initial) {
     if (totalInp) totalInp.value = data.total_time || 0;
     if (simInp)   simInp.value   = data.sim_time   || 0;
     if (simInstInp) simInstInp.value = data.sim_inst || 0;
+    if (sfiSfeInp) sfiSfeInp.value = data.sfi_sfe || 0;
 
     // Show the calculated banner
     const calcBanner = document.getElementById('calc-banner');
@@ -974,18 +981,19 @@ function renderFlightForm(initial) {
   form.appendChild(calcBannerEl);
 
   // Times - with stored references for auto-update
-  let totalInp, simInp, simInstInp;
+  let totalInp, simInp, simInstInp, sfiSfeInp;
   const timeLabel = div({style:{fontSize:'9px',color:'#0066CC',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Time Breakdown (auto-filled from chocks)');
   form.appendChild(timeLabel);
 
   totalInp = mkInp('total_time','number','0.0');
   simInp   = mkInp('sim_time','number','0.0');
   simInstInp = mkInp('sim_inst','number','0.0');
+  sfiSfeInp = mkInp('sfi_sfe','number','0.0');
 
   form.appendChild(row(
     fld('Total Flight', totalInp,'1 0 70px'),
     fld('Sim Time', simInp,'1 0 70px'),
-    fld('Sim Inst', simInstInp,'1 0 70px'),
+    fld('Sim Instrument', simInstInp,'1 0 70px'),
     fld('PIC', mkInp('pic','number','0.0'),'1 0 70px'),
     fld('SIC', mkInp('sic','number','0.0'),'1 0 70px'),
     fld('PICUS', mkInp('picus','number','0.0'),'1 0 70px'),
@@ -1002,7 +1010,7 @@ function renderFlightForm(initial) {
     fld('P1 U/S Night', mkInp('p1us_night','number','0.0'),'1 0 80px'),
     fld('Dual Given', mkInp('dual_given','number','0.0'),'1 0 80px'),
     fld('Relief', mkInp('relief','number','0.0'),'1 0 80px'),
-    fld('SFI / SFE', mkInp('sfi_sfe','number','0.0'),'1 0 80px')
+    fld('SFI / SFE', sfiSfeInp,'1 0 80px')
   ));
 
   // Movements
@@ -1397,7 +1405,8 @@ function render() {
 
     const sections = [
       {title:'Flight Time Summary', color:'var(--sky)', rows:[
-        ['Total Career','total','var(--sky)'],['Total Flight','flight','var(--sky)'],['Simulator','sim','var(--muted)'],
+        ['Total Career','total','var(--sky)'],['Total Flight','flight','var(--sky)'],['Simulator (Student)','sim_student','var(--muted)'],
+        ['SFI / SFE','sfi_sfe','#B8860B'],
         ['PIC','pic','var(--amber)'],['SIC','sic','var(--steel)'],['PICUS','picus','var(--teal)'],
         ['Dual Received','dual','var(--sky)'],['Night','night','#60A5FA'],
         ['Actual IFR','ifr','var(--purple)'],['Sim Instrument','sim_inst','var(--purple)'],['X-Country','xc','var(--teal)'],
@@ -1606,6 +1615,22 @@ function render() {
     const cut90 = new Date(Date.now() - 90 * 86400000);
     const cut6m = new Date(now.getFullYear(), now.getMonth() - 6, now.getDate());
     const last90 = state.flights.filter(f => new Date(f.date) >= cut90);
+    const last90Desc = [...last90].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+
+    // Days remaining before a rolling 90-day requirement lapses: walks the most
+    // recent qualifying flights until the required count is reached, then
+    // returns days left until that anchor flight ages out of the 90-day window.
+    function daysToLapse(sortedDesc, getVal, required) {
+      let cum = 0;
+      for (const f of sortedDesc) {
+        cum += getVal(f);
+        if (cum >= required) {
+          const daysSince = Math.floor((now - new Date(f.date)) / 86400000);
+          return Math.max(0, 90 - daysSince);
+        }
+      }
+      return null;
+    }
 
     // Movements in last 90 days
     // Part 121 operations: 3 takeoffs and landings in preceding 90 days, day or night combined - no separate night-only requirement
@@ -1616,6 +1641,20 @@ function render() {
     // Day recency includes both day AND night movements
     const dayTO90  = dayTO90_only + nightTO90;
     const dayLdg90 = dayLdg90_only + nightLdg90;
+    const toDaysLeft  = daysToLapse(last90Desc, f=>(f.day_takeoffs||0)+(f.night_takeoffs||0), 3);
+    const ldgDaysLeft = daysToLapse(last90Desc, f=>(f.day_landings||0)+(f.night_landings||0), 3);
+
+    // RNP and CAT II/III approach currency (Part 121) - from per-flight summary counts
+    const rnpCount90   = last90.reduce((a,f)=>a+(f.rnav_approaches||0),0);
+    const cat23Count90 = last90.reduce((a,f)=>a+(f.catii||0)+(f.catiii||0),0);
+    const rnpDaysLeft   = daysToLapse(last90Desc, f=>(f.rnav_approaches||0), 1);
+    const cat23DaysLeft = daysToLapse(last90Desc, f=>(f.catii||0)+(f.catiii||0), 1);
+
+    // A330/A340 combined type rating - at least 1 landing in either family in preceding 90 days
+    const a330a340Types = ['A333','A343','A346'];
+    const isA330A340 = f => a330a340Types.some(t=>(f.aircraft_type||'').includes(t));
+    const a330a340Ldg90    = last90.filter(isA330A340).reduce((a,f)=>a+(f.day_landings||0)+(f.night_landings||0),0);
+    const a330a340DaysLeft = daysToLapse(last90Desc.filter(isA330A340), f=>(f.day_landings||0)+(f.night_landings||0), 1);
 
     // Approaches in last 90 days
     const allApch90 = last90.flatMap(f=>f.approaches||[]);
@@ -1654,7 +1693,13 @@ function render() {
       );
     }
 
-    function rItem(label,reg,cur,req,unit,note,ok,col) {
+    function daysBadge(daysLeft) {
+      if (daysLeft===null || daysLeft===undefined) return null;
+      const c = daysLeft>14?{bg:'#E8F5E9',fg:'#2E7D32',bd:'#A5D6A7'}:daysLeft>3?{bg:'#FFF8E1',fg:'#F57F17',bd:'#FFE082'}:{bg:'#FFEBEE',fg:'#C62828',bd:'#FFCDD2'};
+      return el('span',{style:{background:c.bg,color:c.fg,border:'1px solid '+c.bd,borderRadius:'4px',padding:'2px 8px',fontSize:'10px',fontWeight:'700',whiteSpace:'nowrap'}},daysLeft+'d to go');
+    }
+
+    function rItem(label,reg,cur,req,unit,note,ok,col,daysLeft) {
       return div({style:{padding:'9px 0',borderBottom:'1px solid #F5F5F5'}},
         div({style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'8px',marginBottom:'3px',flexWrap:'wrap'}},
           div({style:{flex:1}},
@@ -1663,6 +1708,7 @@ function render() {
           ),
           div({style:{display:'flex',alignItems:'center',gap:'8px',flexShrink:0}},
             el('span',{style:{fontFamily:'monospace',fontSize:'13px',fontWeight:'800',color:ok?'#006B3F':(col||'#0066CC')}},String(cur)+' / '+String(req)+unit),
+            ok?daysBadge(daysLeft):null,
             badge(ok)
           )
         ),
@@ -1686,8 +1732,15 @@ function render() {
 
     // Day/Night T/O and Landings
     main.appendChild(section('Takeoffs and Landings','Part 121 Operations - Required in preceding 90 days','#0066CC',[
-      rItem('Takeoffs','',dayTO90,3,'','Minimum 3 takeoffs in preceding 90 days, day or night combined',dayTO90>=3),
-      rItem('Landings','',dayLdg90,3,'','Minimum 3 landings in preceding 90 days, day or night combined',dayLdg90>=3),
+      rItem('Takeoffs','',dayTO90,3,'','Minimum 3 takeoffs in preceding 90 days, day or night combined',dayTO90>=3,null,toDaysLeft),
+      rItem('Landings','',dayLdg90,3,'','Minimum 3 landings in preceding 90 days, day or night combined',dayLdg90>=3,null,ldgDaysLeft),
+      rItem('A330/A340 Landing','',a330a340Ldg90,1,'','At least 1 landing in either A330 (A333) or A340 (A343/A346) in preceding 90 days for combined type rating currency',a330a340Ldg90>=1,null,a330a340DaysLeft),
+    ]));
+
+    // RNP and CAT II/III Approach Currency (Part 121)
+    main.appendChild(section('RNP and CAT II/III Approach Currency','Part 121 Operations - Required in preceding 90 days','#6F42C1',[
+      rItem('RNP Approaches','',rnpCount90,1,'','At least 1 RNP approach in preceding 90 days',rnpCount90>=1,'#6F42C1',rnpDaysLeft),
+      rItem('CAT II / III Approaches','',cat23Count90,1,'','At least 1 CAT II or CAT III approach in preceding 90 days',cat23Count90>=1,'#6F42C1',cat23DaysLeft),
     ]));
 
     // Instrument Approaches
@@ -1752,6 +1805,7 @@ function render() {
               ? el('span',{style:{fontSize:'12px',color:'#555'}},lastOPC.title+' - '+fmtDate(lastOPC.date_issued)+(opcDays!==null?' ('+opcDays+' days ago)':''))
               : el('span',{style:{fontSize:'12px',color:'#DC3545'}},'No OPC/LPC recorded - add in Endorsements tab')
           ),
+          opcOk?daysBadge(Math.max(0,180-(opcDays||0))):null,
           badge(opcOk)
         ),
         lastOPC?pb(Math.max(0,180-(opcDays||180)),180,'#B8860B'):null,
@@ -1806,8 +1860,10 @@ function render() {
     // Summary strip
     const summaryItems = [
       ['Takeoffs',dayTO90>=3,dayTO90+'/3'],['Landings',dayLdg90>=3,dayLdg90+'/3'],
+      ['A330/340 Ldg',a330a340Ldg90>=1,a330a340Ldg90+'/1'],
       ['Inst Apch',instrApch.length>=2,instrApch.length+'/2'],
       ['2D Apch',apch2D>=1,apch2D+'/1'],['3D Apch',apch3D>=1,apch3D+'/1'],
+      ['RNP Apch',rnpCount90>=1,rnpCount90+'/1'],['CAT II/III',cat23Count90>=1,cat23Count90+'/1'],
       ['OPC/LPC',opcOk,opcOk?'VALID':'CHECK'],['Medical',medOk,medOk?'VALID':'CHECK'],
     ];
     const summary = div({style:{background:'#F8F9FA',border:'1px solid #DEE2E6',borderRadius:'8px',padding:'12px 16px',marginTop:'4px'}},
