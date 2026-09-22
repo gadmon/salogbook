@@ -666,7 +666,7 @@ async function deleteDocument(doc) {
 
 // ─── COMPUTED ─────────────────────────────────────────────────────────────────
 function computeTotals(flights) {
-  return flights.reduce((a, e) => {
+  const t = flights.reduce((a, e) => {
     a.total += (e.total_time||0)+(e.sim_time||0);
     a.flight += (e.total_time||0);
     a.sim += (e.sim_time||0);
@@ -687,6 +687,10 @@ function computeTotals(flights) {
     a.pf_time += e.pilot_flying ? (e.total_time||0) : 0;
     return a;
   }, {total:0,flight:0,sim:0,sfi_sfe:0,sim_student:0,pic:0,picus:0,sic:0,dual:0,solo:0,night:0,ifr:0,sim_inst:0,xc:0,day_ldgs:0,night_ldgs:0,approaches:0,pf_time:0});
+  // Total flying hours (real aircraft + sim time received as a student), excluding
+  // hours spent instructing/examining others in the simulator (SFI/SFE)
+  t.flying_excl_sfi = t.total - t.sfi_sfe;
+  return t;
 }
 
 function filteredFlights() {
@@ -1399,7 +1403,7 @@ function render() {
           span({style:{color:roleCol,fontSize:'11px',fontWeight:'600'}},f.pilot_role),
           f.duty_role?div({style:{color:'var(--gold)',fontSize:'10px',fontWeight:'700'}},f.duty_role):null
         ));
-        tr.appendChild(el('td',{style:{fontSize:'12px',textAlign:'center',color:f.pilot_flying?'#006B3F':'var(--muted)',fontWeight:f.pilot_flying?'700':'400'}},f.pilot_flying?'PF':'-'));
+        tr.appendChild(el('td',{style:{fontSize:'12px',textAlign:'center',color:f.pilot_flying?'#0D6E6E':'var(--muted)',fontWeight:f.pilot_flying?'700':'400'}},f.pilot_flying?'PF':'-'));
         tr.appendChild(el('td',{style:{fontFamily:'monospace',fontWeight:'700',color:'#0066CC'}},hhmm(ft)));
         tr.appendChild(el('td',{style:{fontFamily:'monospace',color:'#006B3F'}},hhmm(f.pic||0)));
         tr.appendChild(el('td',{style:{fontFamily:'monospace',color:'#555555'}},hhmm(f.night||0)));
@@ -1442,7 +1446,7 @@ function render() {
 
     const sections = [
       {title:'Flight Time Summary', color:'var(--sky)', rows:[
-        ['Total Career','total','var(--sky)'],['Total Flight','flight','var(--sky)'],['Pilot Flying','pf_time','var(--green)'],['Simulator (Student)','sim_student','var(--muted)'],
+        ['Total Career','total','var(--sky)'],['Total Flight','flight','var(--sky)'],['Total Flying (excl. Sim Instruction Given)','flying_excl_sfi','var(--sky)'],['Pilot Flying','pf_time','var(--teal)'],['Simulator (Student)','sim_student','var(--muted)'],
         ['SFI / SFE','sfi_sfe','#B8860B'],
         ['PIC','pic','var(--amber)'],['SIC','sic','var(--steel)'],['PICUS','picus','var(--teal)'],
         ['Dual Received','dual','var(--sky)'],['Night','night','#60A5FA'],
