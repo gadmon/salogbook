@@ -1107,8 +1107,8 @@ function renderFlightForm(initial) {
 
 // ─── ENDORSEMENT FORM ─────────────────────────────────────────────────────────
 function renderEndorseForm(initial) {
-  const CATS = ['PPL / Licence','Night Rating','Type / Class Rating','Instrument Rating','Medical Certificate','Skills Test','Ground Examination','Instructor Sign-off','Other'];
-  const CA = {'PPL / Licence':'CA 61-01 / CA 61-04','Night Rating':'CA 61-04 (Night)','Type / Class Rating':'CA 61-09.7 / CA 61-09.8','Instrument Rating':'CA 61-05','Medical Certificate':'CA Med 1','Skills Test':'CA 61-04 Skills Test'};
+  const CATS = ['PPL / Licence','Night Rating','Type / Class Rating','Instrument Rating','OPC / LPC','Medical Certificate','Skills Test','Ground Examination','Instructor Sign-off','Other'];
+  const CA = {'PPL / Licence':'CA 61-01 / CA 61-04','Night Rating':'CA 61-04 (Night)','Type / Class Rating':'CA 61-09.7 / CA 61-09.8','Instrument Rating':'CA 61-05','OPC / LPC':'CA 61.12','Medical Certificate':'CA Med 1','Skills Test':'CA 61-04 Skills Test'};
   const data = initial ? {...initial} : { category:'PPL / Licence', title:'', aircraft_type:'', date_issued:today(), expiry_date:'', instructor:'', licence_no:'', ca_form:'CA 61-01 / CA 61-04', submitted:false, submitted_date:'', remarks:'' };
 
   const si = {width:'100%',background:'#FFFFFF',border:'1px solid #CED4DA',borderRadius:'6px',padding:'7px 10px',color:'var(--text)',fontSize:'13px',fontFamily:'inherit',outline:'none'};
@@ -1656,11 +1656,11 @@ function render() {
     const a330a340Ldg90    = last90.filter(isA330A340).reduce((a,f)=>a+(f.day_landings||0)+(f.night_landings||0),0);
     const a330a340DaysLeft = daysToLapse(last90Desc.filter(isA330A340), f=>(f.day_landings||0)+(f.night_landings||0), 1);
 
-    // Approaches in last 90 days
-    const allApch90 = last90.flatMap(f=>f.approaches||[]);
-    const instrApch = allApch90.filter(a=>a.type&&!a.type.toLowerCase().includes('visual')&&!a.type.toLowerCase().includes('circling'));
-    const apch2D = allApch90.filter(a=>a.type&&(a.type.includes('VOR')||a.type.includes('NDB')||a.type.includes('LNAV')||a.type.includes('LOC')||a.type.includes('2D')||a.type.includes('Non-Precision'))).length;
-    const apch3D = allApch90.filter(a=>a.type&&(a.type.includes('ILS')||a.type.includes('GLS')||a.type.includes('LPV')||a.type.includes('LNAV/VNAV')||a.type.includes('3D')||a.type.includes('RNP AR')||a.type.includes('Autoland'))).length;
+    // Approaches in last 90 days (from LogTenPro-imported per-flight summary counts)
+    const totalApchCount90 = last90.reduce((a,f)=>a+(f.ils_approaches||0)+(f.rnav_approaches||0)+(f.catii||0)+(f.catiii||0),0);
+    const precisionApchCount90 = last90.reduce((a,f)=>a+(f.ils_approaches||0)+(f.catii||0)+(f.catiii||0),0);
+    const totalApchDaysLeft = daysToLapse(last90Desc, f=>(f.ils_approaches||0)+(f.rnav_approaches||0)+(f.catii||0)+(f.catiii||0), 2);
+    const precisionApchDaysLeft = daysToLapse(last90Desc, f=>(f.ils_approaches||0)+(f.catii||0)+(f.catiii||0), 1);
 
     // OPC from endorsements
     const lastOPC = [...state.endorsements].filter(e=>e.category==='OPC / LPC').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
@@ -1737,62 +1737,13 @@ function render() {
       rItem('A330/A340 Landing','',a330a340Ldg90,1,'','At least 1 landing in either A330 (A333) or A340 (A343/A346) in preceding 90 days for combined type rating currency',a330a340Ldg90>=1,null,a330a340DaysLeft),
     ]));
 
-    // RNP and CAT II/III Approach Currency (Part 121)
-    main.appendChild(section('RNP and CAT II/III Approach Currency','Part 121 Operations - Required in preceding 90 days','#6F42C1',[
+    // Instrument Approach Currency (Part 121) - merges total/precision/RNP/CAT II-III into one card
+    main.appendChild(section('Instrument Approach Currency','Part 121 Operations - Required in preceding 90 days','#6F42C1',[
+      rItem('Total Instrument Approaches','',totalApchCount90,2,'','At least 2 instrument approaches in preceding 90 days (ILS, RNAV/RNP, CAT II, CAT III)',totalApchCount90>=2,'#6F42C1',totalApchDaysLeft),
+      rItem('Precision Approaches','',precisionApchCount90,1,'','At least 1 precision approach (ILS, CAT II or CAT III) in preceding 90 days',precisionApchCount90>=1,'#6F42C1',precisionApchDaysLeft),
       rItem('RNP Approaches','',rnpCount90,1,'','At least 1 RNP approach in preceding 90 days',rnpCount90>=1,'#6F42C1',rnpDaysLeft),
       rItem('CAT II / III Approaches','',cat23Count90,1,'','At least 1 CAT II or CAT III approach in preceding 90 days',cat23Count90>=1,'#6F42C1',cat23DaysLeft),
     ]));
-
-    // Instrument Approaches
-    main.appendChild(section('Instrument Approach Currency','SA-CAR 61.01.8(4) - Required in preceding 90 days','#6F42C1',[
-      rItem('Total Instrument Approaches','CAR 61.01.8(4)(a)',instrApch.length,2,'','At least 2 instrument approaches in preceding 90 days. Minimum 1 must be in an actual aircraft (not FSTD only)',instrApch.length>=2,'#6F42C1'),
-      rItem('2D Approaches (Non-Precision)','CAR 61.01.8(4)(d)',apch2D,1,'','At least 1 x 2D non-precision approach (VOR/NDB/RNAV LNAV/LOC) in preceding 90 days to conduct 2D approaches in IMC',apch2D>=1,'#6F42C1'),
-      rItem('3D Approaches (Precision)','CAR 61.01.8(4)(c)',apch3D,1,'','At least 1 x 3D precision approach (ILS/GLS/RNP AR/LPV) in preceding 90 days to conduct 3D approaches in IMC',apch3D>=1,'#6F42C1'),
-    ]));
-
-    // Approach detail log - show last 10 approaches with expiry dates
-    const apchWithDates = [];
-    last90.forEach(f => {
-      (f.approaches||[]).forEach(a => {
-        apchWithDates.push({...a, flight_date: f.date, aircraft: f.aircraft_type||f.aircraft_reg||''});
-      });
-    });
-    apchWithDates.sort((a,b) => b.flight_date.localeCompare(a.flight_date));
-
-    if(apchWithDates.length > 0) {
-      const apchDetail = section('Approach Currency Detail','Last approaches in 90-day window - sorted by date','#6F42C1',[
-        div({style:{marginBottom:'6px',fontSize:'11px',color:'#888'}},
-          'Showing '+apchWithDates.length+' approach'+(apchWithDates.length!==1?'es':'')+' in last 90 days. Each approach expires 90 days after it was flown.'
-        ),
-        ...apchWithDates.map(a => {
-          const flownDate = new Date(a.flight_date);
-          const expiryDate = new Date(flownDate.getTime() + 90*86400000);
-          const daysLeft = Math.round((expiryDate - now) / 86400000);
-          const is3D = a.type&&(a.type.includes('ILS')||a.type.includes('GLS')||a.type.includes('RNP AR')||a.type.includes('LPV')||a.type.includes('3D')||a.type.includes('Autoland'));
-          const is2D = a.type&&(a.type.includes('VOR')||a.type.includes('NDB')||a.type.includes('LNAV')||a.type.includes('LOC')||a.type.includes('2D'));
-          return div({style:{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid #F5F5F5',flexWrap:'wrap',gap:'6px'}},
-            div({style:{flex:1}},
-              el('span',{style:{fontWeight:'700',color:'#1A1A1A',fontSize:'12px',fontFamily:'monospace'}},a.type||'Unknown'),
-              el('span',{style:{fontSize:'11px',color:'#888',marginLeft:'8px'}},
-                (a.rwy?'RWY '+a.rwy+' ':'')+a.airport+' - '+fmtDate(a.flight_date)+' ('+a.aircraft+')'
-              ),
-              el('br'),
-              el('span',{style:{fontSize:'10px',color:'#555'}},
-                'Expires: '+fmtDate(expiryDate.toISOString().slice(0,10))+
-                ' ('+daysLeft+' days) - '+(is3D?'3D Precision':is2D?'2D Non-Precision':'Other')
-              )
-            ),
-            el('span',{style:{
-              background:daysLeft>30?'#E8F5E9':daysLeft>0?'#FFF8E1':'#FFEBEE',
-              color:daysLeft>30?'#2E7D32':daysLeft>0?'#F57F17':'#C62828',
-              border:'1px solid '+(daysLeft>30?'#A5D6A7':daysLeft>0?'#FFE082':'#FFCDD2'),
-              borderRadius:'4px',padding:'2px 8px',fontSize:'10px',fontWeight:'700'
-            }},daysLeft>0?daysLeft+'d left':'EXPIRED')
-          );
-        })
-      ]);
-      main.appendChild(apchDetail);
-    }
 
     // OPC/LPC
     const opcCard = section('Operator Proficiency Check (OPC / LPC)','SA-CAR 61.12 - Required every 6 months (180 days)','#B8860B',[
@@ -1861,8 +1812,8 @@ function render() {
     const summaryItems = [
       ['Takeoffs',dayTO90>=3,dayTO90+'/3'],['Landings',dayLdg90>=3,dayLdg90+'/3'],
       ['A330/340 Ldg',a330a340Ldg90>=1,a330a340Ldg90+'/1'],
-      ['Inst Apch',instrApch.length>=2,instrApch.length+'/2'],
-      ['2D Apch',apch2D>=1,apch2D+'/1'],['3D Apch',apch3D>=1,apch3D+'/1'],
+      ['Total Apch',totalApchCount90>=2,totalApchCount90+'/2'],
+      ['Precision Apch',precisionApchCount90>=1,precisionApchCount90+'/1'],
       ['RNP Apch',rnpCount90>=1,rnpCount90+'/1'],['CAT II/III',cat23Count90>=1,cat23Count90+'/1'],
       ['OPC/LPC',opcOk,opcOk?'VALID':'CHECK'],['Medical',medOk,medOk?'VALID':'CHECK'],
     ];
