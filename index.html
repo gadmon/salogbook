@@ -1174,7 +1174,45 @@ function renderEndorseForm(initial) {
   row4.appendChild(div({style:{flex:'1',minWidth:'110px'}}, fld('Signed By', mkI('instructor','text','Instructor / DFE / AME'))));
   row4.appendChild(div({style:{flex:'1',minWidth:'110px'}}, fld('Licence / Auth No', mkI('licence_no','text','SACAA number'))));
   form.appendChild(row4);
-  const subWrap = div({style:{marginBottom:'10px'}});
+  const scanWrap = div({style:{marginBottom:'10px'}});
+  scanWrap.appendChild(el('label',{style:{display:'block',fontSize:'10px',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:'5px'}},'Attach Original (scan/photo with signature)'));
+  const scanStatus = div({style:{fontSize:'12px',color:'var(--steel)',marginBottom:'6px'}});
+  function renderScanStatus(){
+    scanStatus.innerHTML = '';
+    if (data.scan_path) {
+      const link = el('a',{href:'#',style:{color:'var(--sky)',fontWeight:'600',cursor:'pointer',textDecoration:'none'},onclick:async(e)=>{e.preventDefault();const url=await getDocUrl(data.scan_path);if(url)window.open(url,'_blank');}},'View attached scan');
+      scanStatus.appendChild(link);
+      scanStatus.appendChild(span({style:{margin:'0 8px',color:'var(--muted)'}},'|'));
+      const rm = el('a',{href:'#',style:{color:'var(--red)',cursor:'pointer',textDecoration:'none'},onclick:(e)=>{e.preventDefault();data.scan_path='';renderScanStatus();}},'Remove');
+      scanStatus.appendChild(rm);
+    } else {
+      scanStatus.appendChild(span({style:{color:'var(--muted)'}},'No scan attached'));
+    }
+  }
+  renderScanStatus();
+  scanWrap.appendChild(scanStatus);
+  const scanFileInp = inp({type:'file',accept:'image/*,.pdf',style:si});
+  scanFileInp.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    scanStatus.innerHTML = '';
+    scanStatus.appendChild(span({style:{color:'var(--muted)'}},'Uploading...'));
+    try {
+      const uid = state.session.user.id;
+      const path = uid+'/endorsements/'+Date.now()+'_'+file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+      const { error: upErr } = await sb.storage.from('pilot-docs').upload(path, file);
+      if (upErr) throw upErr;
+      data.scan_path = path;
+      toast('Scan attached');
+      renderScanStatus();
+    } catch(err) {
+      toast('Upload error: '+err.message,'var(--red)');
+      renderScanStatus();
+    }
+  };
+  scanWrap.appendChild(scanFileInp);
+  form.appendChild(scanWrap);
+  const subWrap = div({style:{marginBottom:'10px'}}); = div({style:{marginBottom:'10px'}});
   subWrap.appendChild(el('label',{style:{display:'block',fontSize:'10px',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:'5px'}},'Submitted to SACAA (within 30 days)'));
   const subChk = inp({type:'checkbox',style:{width:'16px',height:'16px',accentColor:'var(--green)',cursor:'pointer',marginRight:'8px'}});
   if(data.submitted) subChk.checked = true;
