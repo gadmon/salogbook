@@ -1150,7 +1150,7 @@ function renderFlightForm(initial) {
 function renderEndorseForm(initial) {
   const CATS = ['PPL / Licence','Night Rating','Type / Class Rating','Instrument Rating','OPC / LPC','Medical Certificate','Skills Test','Ground Examination','Instructor Sign-off','Other'];
   const CA = {'PPL / Licence':'CA 61-01 / CA 61-04','Night Rating':'CA 61-04 (Night)','Type / Class Rating':'CA 61-09.7 / CA 61-09.8','Instrument Rating':'CA 61-05','OPC / LPC':'CA 61.12','Medical Certificate':'CA Med 1','Skills Test':'CA 61-04 Skills Test'};
-  const data = initial ? {...initial} : { category:'PPL / Licence', title:'', aircraft_type:'', date_issued:today(), expiry_date:'', instructor:'', licence_no:'', ca_form:'CA 61-01 / CA 61-04', submitted:false, submitted_date:'', remarks:'' };
+  const data = initial ? {...initial} : { category:'PPL / Licence', title:'', aircraft_type:'', date_issued:today(), expiry_date:'', instructor:'', licence_no:'', ca_form:'CA 61-01 / CA 61-04', submitted:false, submitted_date:'', remarks:'', scan_path:'' };
 
   const si = {width:'100%',background:'#FFFFFF',border:'1px solid #CED4DA',borderRadius:'6px',padding:'7px 10px',color:'var(--text)',fontSize:'13px',fontFamily:'inherit',outline:'none'};
   const form = div({});
@@ -1955,21 +1955,23 @@ function render() {
       ));
       main.appendChild(makeReportTable([...state.flights].slice(0,36),'Most Recent 36 Entries','Last 3 logbook pages'));
 
-      // Latest endorsements required for revalidation: OPC/LPC/PPC and Instrument Rating (IF)
+      // Latest endorsements required for revalidation: OPC/LPC/PPC, Instrument Rating (IF) and Type/Class Rating
       const latestOpcLpcPpc = [...state.endorsements].filter(e=>e.category==='OPC / LPC'||/ppc/i.test(e.title||'')).sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
       const latestIF = [...state.endorsements].filter(e=>e.category==='Instrument Rating').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
+      const latestTypeRating = [...state.endorsements].filter(e=>e.category==='Type / Class Rating').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
       main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--amber)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
         span({style:{fontWeight:'700',color:'var(--amber)',fontSize:'12px'}},'Latest Endorsements for Revalidation'),
-        span({style:{fontSize:'11px',color:'var(--steel)'}},'OPC / LPC / PPC and Instrument Rating (IF)')
+        span({style:{fontSize:'11px',color:'var(--steel)'}},'OPC / LPC / PPC, Instrument Rating (IF) and Type / Class Rating')
       ));
       const revalWrap = div({style:{background:'var(--card)',border:'2px solid var(--amber)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
-      [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF]].forEach(([label,e])=>{
+      [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF],['Type / Class Rating',latestTypeRating]].forEach(([label,e])=>{
         const row = div({style:{display:'flex',gap:'12px',padding:'8px 0',borderBottom:'1px solid var(--border)22',fontSize:'12px',flexWrap:'wrap',alignItems:'center'}});
         row.appendChild(span({style:{color:'var(--sky)',minWidth:'190px',fontWeight:'700'}},label));
         if (e) {
           row.appendChild(span({style:{color:'var(--text)',flex:'1',fontWeight:'600'}},e.title||e.category));
           if(e.date_issued) row.appendChild(span({style:{color:'var(--steel)'}},fmtDate(e.date_issued)));
           if(e.expiry_date) row.appendChild(span({style:{color:'var(--muted)'}},'exp: '+fmtDate(e.expiry_date)));
+          if(e.scan_path) row.appendChild(btn({style:{background:'var(--sky)',border:'none',color:'#fff',borderRadius:'5px',padding:'3px 10px',fontSize:'11px',fontWeight:'700',cursor:'pointer'},onclick:async()=>{const url=await getDocUrl(e.scan_path);if(url)window.open(url,'_blank');}},'View Original'));
         } else {
           row.appendChild(span({style:{color:'var(--red)',flex:'1'}},'No record on file - add in Endorsements tab'));
         }
