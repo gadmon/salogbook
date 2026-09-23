@@ -147,6 +147,7 @@ function toast(msg, col='var(--green)') {
 let state = {
   session: null, profile: null, flights: [], endorsements: [], documents: [],
   tab: 'log', loading: true, authMode: 'login',
+  reportType: 'revalidation',
   showFlightForm: false, editFlight: null, viewFlight: null,
   showEndorseForm: false, editEndorse: null, showAIScan: false,
   showImport: false, showDocUpload: false,
@@ -1872,6 +1873,7 @@ function render() {
   }
 
   else if (state.tab === 'reports') {
+    if (!state.reportType) state.reportType = 'revalidation';
     const pdate = now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'});
     const rh = div({style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'14px',flexWrap:'wrap',gap:'10px'}});
     rh.appendChild(div({},
@@ -1881,9 +1883,25 @@ function render() {
     rh.appendChild(btn({style:{background:'var(--green)',border:'none',color:'var(--gold)',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>window.print()},'Print / PDF'));
     main.appendChild(rh);
 
-    main.appendChild(div({style:{background:'var(--sky)11',border:'1px solid var(--sky)33',borderLeft:'4px solid var(--sky)',borderRadius:'8px',padding:'10px 14px',marginBottom:'14px',fontSize:'12px',color:'var(--dim)',lineHeight:'1.8'}},
-      'CAR 61.01.5(13): Annual certified summary required. CAR 61.03-61.08.6(c): Certified copies of last 3 pages for revalidation. CAR 61.01.8(1): Print every 90 days and file in binder. All reports must be certified by a Commissioner of Oaths before SACAA submission.'
-    ));
+    // Report picker - three separate, independently printable reports
+    const reportOptions = [
+      ['revalidation','IF / PPC Revalidation'],
+      ['ninety','90-Day Print'],
+      ['resume','Resume / Career Summary'],
+    ];
+    const picker = div({style:{display:'flex',gap:'8px',flexWrap:'wrap',marginBottom:'14px'}});
+    reportOptions.forEach(([key,label])=>{
+      const active = state.reportType===key;
+      picker.appendChild(btn({style:{background:active?'var(--sky)':'var(--card)',border:'1px solid var(--sky)'+(active?'':'44'),color:active?'#fff':'var(--sky)',borderRadius:'20px',padding:'7px 16px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>setState({reportType:key})},label));
+    });
+    main.appendChild(picker);
+
+    const noteText = {
+      revalidation: 'CAR 61.01.5(13): Annual certified summary required. CAR 61.03-61.08.6(c): Certified copies of last 3 pages for revalidation. This report must be certified by a Commissioner of Oaths before SACAA submission.',
+      ninety: 'CAR 61.01.8(1): Print your electronic logbook every 90 days and file the hard copy in a binder.',
+      resume: 'Not a SACAA compliance report - a clean summary of total flying hours by role and by aircraft type, suitable for a CV or job application.',
+    }[state.reportType];
+    main.appendChild(div({style:{background:'var(--sky)11',border:'1px solid var(--sky)33',borderLeft:'4px solid var(--sky)',borderRadius:'8px',padding:'10px 14px',marginBottom:'14px',fontSize:'12px',color:'var(--dim)',lineHeight:'1.8'}}, noteText));
 
     function makeReportTable(rows, title, sub) {
       const wrap = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
@@ -1912,90 +1930,121 @@ function render() {
       return wrap;
     }
 
-    main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
-      span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Report 1 - 12-Month Certified Summary of Hours'),
-      span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.01.5(13)')
-    ));
-    (() => {
-      const t12 = computeTotals(last12);
-      const sumWrap = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
-      sumWrap.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'3px'}},'Summary of Hours Flown: '+cut12.toLocaleDateString('en-ZA')+' to '+now.toLocaleDateString('en-ZA')));
-      sumWrap.appendChild(div({style:{fontSize:'11px',color:'var(--steel)',marginBottom:'10px'}},last12.length+' entries in period'));
-      const g1 = div({style:{display:'flex',gap:'7px',flexWrap:'wrap',marginBottom:'8px'}});
-      [['Total','total','h'],['Flight','flight','h'],['PIC','pic','h'],['SIC','sic','h'],['Night','night','h'],['IFR','ifr','h'],['Sim','sim','h'],['XC','xc','h']].forEach(([l,k,u])=>g1.appendChild(statCard(l,t12[k],u,'var(--sky)')));
-      sumWrap.appendChild(g1);
-      const g2 = div({style:{display:'flex',gap:'7px',flexWrap:'wrap'}});
-      [['Day Landings','day_ldgs',''],['Night Landings','night_ldgs',''],['Approaches','approaches','']].forEach(([l,k,u])=>g2.appendChild(statCard(l,Math.round(t12[k]),u,'var(--green)')));
-      sumWrap.appendChild(g2);
-      main.appendChild(sumWrap);
-    })();
+    if (state.reportType === 'revalidation') {
+      main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
+        span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'12-Month Certified Summary of Hours'),
+        span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.01.5(13)')
+      ));
+      (() => {
+        const t12 = computeTotals(last12);
+        const sumWrap = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
+        sumWrap.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'3px'}},'Summary of Hours Flown: '+cut12.toLocaleDateString('en-ZA')+' to '+now.toLocaleDateString('en-ZA')));
+        sumWrap.appendChild(div({style:{fontSize:'11px',color:'var(--steel)',marginBottom:'10px'}},last12.length+' entries in period'));
+        const g1 = div({style:{display:'flex',gap:'7px',flexWrap:'wrap',marginBottom:'8px'}});
+        [['Total','total','h'],['Flight','flight','h'],['PIC','pic','h'],['SIC','sic','h'],['Night','night','h'],['IFR','ifr','h'],['Sim','sim','h'],['XC','xc','h']].forEach(([l,k,u])=>g1.appendChild(statCard(l,t12[k],u,'var(--sky)')));
+        sumWrap.appendChild(g1);
+        const g2 = div({style:{display:'flex',gap:'7px',flexWrap:'wrap'}});
+        [['Day Landings','day_ldgs',''],['Night Landings','night_ldgs',''],['Approaches','approaches','']].forEach(([l,k,u])=>g2.appendChild(statCard(l,Math.round(t12[k]),u,'var(--green)')));
+        sumWrap.appendChild(g2);
+        main.appendChild(sumWrap);
+      })();
 
-    main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
-      span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Report 2 - Last 3 Pages'),
-      span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.03-61.08.6(c) - Commissioner of Oaths required')
-    ));
-    main.appendChild(makeReportTable([...state.flights].slice(0,36),'Most Recent 36 Entries','Last 3 logbook pages'));
+      main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
+        span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Last 3 Pages'),
+        span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.03-61.08.6(c) - Commissioner of Oaths required')
+      ));
+      main.appendChild(makeReportTable([...state.flights].slice(0,36),'Most Recent 36 Entries','Last 3 logbook pages'));
 
-    // Latest endorsements required for revalidation: OPC/LPC/PPC and Instrument Rating (IF)
-    const latestOpcLpcPpc = [...state.endorsements].filter(e=>e.category==='OPC / LPC'||/ppc/i.test(e.title||'')).sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
-    const latestIF = [...state.endorsements].filter(e=>e.category==='Instrument Rating').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
-    main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--amber)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
-      span({style:{fontWeight:'700',color:'var(--amber)',fontSize:'12px'}},'Latest Endorsements for Revalidation'),
-      span({style:{fontSize:'11px',color:'var(--steel)'}},'OPC / LPC / PPC and Instrument Rating (IF)')
-    ));
-    const revalWrap = div({style:{background:'var(--card)',border:'2px solid var(--amber)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
-    [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF]].forEach(([label,e])=>{
-      const row = div({style:{display:'flex',gap:'12px',padding:'8px 0',borderBottom:'1px solid var(--border)22',fontSize:'12px',flexWrap:'wrap',alignItems:'center'}});
-      row.appendChild(span({style:{color:'var(--sky)',minWidth:'190px',fontWeight:'700'}},label));
-      if (e) {
-        row.appendChild(span({style:{color:'var(--text)',flex:'1',fontWeight:'600'}},e.title||e.category));
-        if(e.date_issued) row.appendChild(span({style:{color:'var(--steel)'}},fmtDate(e.date_issued)));
-        if(e.expiry_date) row.appendChild(span({style:{color:'var(--muted)'}},'exp: '+fmtDate(e.expiry_date)));
-      } else {
-        row.appendChild(span({style:{color:'var(--red)',flex:'1'}},'No record on file - add in Endorsements tab'));
-      }
-      revalWrap.appendChild(row);
-    });
-    main.appendChild(revalWrap);
-
-    main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--green)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
-      span({style:{fontWeight:'700',color:'var(--green)',fontSize:'12px'}},'Report 3 - 90-Day Print Period'),
-      span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.01.8(1) - print and file every 90 days')
-    ));
-    main.appendChild(makeReportTable(last90,'90-Day Log: '+cut90.toLocaleDateString('en-ZA')+' to '+now.toLocaleDateString('en-ZA'),last90.length+' entries'));
-
-    if (state.endorsements.length > 0) {
-      const ewrap = div({style:{background:'var(--card)',border:'2px solid var(--amber)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'14px'}});
-      ewrap.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--amber)',marginBottom:'10px'}},'Endorsements on Record ('+state.endorsements.length+')'));
-      state.endorsements.forEach(e=>{
-        const er=div({style:{display:'flex',gap:'12px',padding:'5px 0',borderBottom:'1px solid var(--border)22',fontSize:'11px',flexWrap:'wrap'}});
-        er.appendChild(span({style:{color:'var(--sky)',minWidth:'130px'}},e.category));
-        er.appendChild(span({style:{color:'var(--text)',flex:'1',fontWeight:'600'}},e.title));
-        if(e.aircraft_type) er.appendChild(span({style:{color:'var(--amber)',fontFamily:'monospace'}},e.aircraft_type));
-        if(e.date_issued) er.appendChild(span({style:{color:'var(--steel)'}},fmtDate(e.date_issued)));
-        if(e.expiry_date) er.appendChild(span({style:{color:'var(--muted)'}},'exp: '+fmtDate(e.expiry_date)));
-        ewrap.appendChild(er);
+      // Latest endorsements required for revalidation: OPC/LPC/PPC and Instrument Rating (IF)
+      const latestOpcLpcPpc = [...state.endorsements].filter(e=>e.category==='OPC / LPC'||/ppc/i.test(e.title||'')).sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
+      const latestIF = [...state.endorsements].filter(e=>e.category==='Instrument Rating').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
+      main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--amber)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
+        span({style:{fontWeight:'700',color:'var(--amber)',fontSize:'12px'}},'Latest Endorsements for Revalidation'),
+        span({style:{fontSize:'11px',color:'var(--steel)'}},'OPC / LPC / PPC and Instrument Rating (IF)')
+      ));
+      const revalWrap = div({style:{background:'var(--card)',border:'2px solid var(--amber)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
+      [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF]].forEach(([label,e])=>{
+        const row = div({style:{display:'flex',gap:'12px',padding:'8px 0',borderBottom:'1px solid var(--border)22',fontSize:'12px',flexWrap:'wrap',alignItems:'center'}});
+        row.appendChild(span({style:{color:'var(--sky)',minWidth:'190px',fontWeight:'700'}},label));
+        if (e) {
+          row.appendChild(span({style:{color:'var(--text)',flex:'1',fontWeight:'600'}},e.title||e.category));
+          if(e.date_issued) row.appendChild(span({style:{color:'var(--steel)'}},fmtDate(e.date_issued)));
+          if(e.expiry_date) row.appendChild(span({style:{color:'var(--muted)'}},'exp: '+fmtDate(e.expiry_date)));
+        } else {
+          row.appendChild(span({style:{color:'var(--red)',flex:'1'}},'No record on file - add in Endorsements tab'));
+        }
+        revalWrap.appendChild(row);
       });
-      main.appendChild(ewrap);
+      main.appendChild(revalWrap);
+
+      // Commissioner block
+      const cob = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'18px 20px',marginTop:'10px'}});
+      cob.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'12px'}},'Commissioner of Oaths Certification'));
+      cob.appendChild(div({style:{fontSize:'12px',color:'var(--steel)',lineHeight:'1.8',marginBottom:'14px'}},
+        'I, the undersigned Commissioner of Oaths, hereby certify that this is a true and correct copy of the logbook summary for pilot ',
+        el('strong',{style:{color:'var(--text)'}},(state.profile?.full_name||'_______________')),
+        ', as required by SACAA CAR 61.01.5(13), 61.03.6(c), 61.04.6(c) and 61.08.6(c).'
+      ));
+      const grid2 = div({style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'16px'}});
+      [['Pilot Name',state.profile?.full_name||''],['Licence Number',state.profile?.licence_number||''],['Date of Report',pdate],['Pilot Signature','________________________'],['Commissioner Name','________________________'],['Commissioner Signature','________________________'],['Date Certified','________________________'],['Commissioner Stamp / Registration','________________________']].forEach(([l,v])=>{
+        const f=div({style:{borderBottom:'1px solid var(--border)',paddingBottom:'7px'}});
+        f.appendChild(div({style:{fontSize:'9px',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:'4px'}},l));
+        f.appendChild(div({style:{fontSize:'13px',color:'var(--dim)'}},v));
+        grid2.appendChild(f);
+      });
+      cob.appendChild(grid2);
+      main.appendChild(cob);
     }
 
-    // Commissioner block
-    const cob = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'18px 20px',marginTop:'10px'}});
-    cob.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'12px'}},'Commissioner of Oaths Certification'));
-    cob.appendChild(div({style:{fontSize:'12px',color:'var(--steel)',lineHeight:'1.8',marginBottom:'14px'}},
-      'I, the undersigned Commissioner of Oaths, hereby certify that this is a true and correct copy of the logbook summary for pilot ',
-      el('strong',{style:{color:'var(--text)'}},(state.profile?.full_name||'_______________')),
-      ', as required by SACAA CAR 61.01.5(13), 61.03.6(c), 61.04.6(c) and 61.08.6(c).'
-    ));
-    const grid2 = div({style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'16px'}});
-    [['Pilot Name',state.profile?.full_name||''],['Licence Number',state.profile?.licence_number||''],['Date of Report',pdate],['Pilot Signature','________________________'],['Commissioner Name','________________________'],['Commissioner Signature','________________________'],['Date Certified','________________________'],['Commissioner Stamp / Registration','________________________']].forEach(([l,v])=>{
-      const f=div({style:{borderBottom:'1px solid var(--border)',paddingBottom:'7px'}});
-      f.appendChild(div({style:{fontSize:'9px',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:'4px'}},l));
-      f.appendChild(div({style:{fontSize:'13px',color:'var(--dim)'}},v));
-      grid2.appendChild(f);
-    });
-    cob.appendChild(grid2);
-    main.appendChild(cob);
+    else if (state.reportType === 'ninety') {
+      main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--green)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
+        span({style:{fontWeight:'700',color:'var(--green)',fontSize:'12px'}},'90-Day Print Period'),
+        span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.01.8(1) - print and file every 90 days')
+      ));
+      main.appendChild(makeReportTable(last90,'90-Day Log: '+cut90.toLocaleDateString('en-ZA')+' to '+now.toLocaleDateString('en-ZA'),last90.length+' entries'));
+    }
+
+    else if (state.reportType === 'resume') {
+      main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
+        span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Career Flying Experience Summary'),
+        span({style:{fontSize:'11px',color:'var(--steel)'}},(state.profile?.full_name||'')+' - '+(state.profile?.licence_type||''))
+      ));
+
+      const roleWrap = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
+      roleWrap.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'10px'}},'Hours by Role'));
+      const rGrid = div({style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(120px,1fr))',gap:'8px'}});
+      [
+        ['Total Career','total','var(--sky)'],['Total Flight','flight','var(--sky)'],
+        ['PIC','pic','var(--amber)'],['SIC','sic','var(--steel)'],['PICUS','picus','var(--teal)'],
+        ['Dual Received','dual','var(--sky)'],['SFI / SFE','sfi_sfe','#B8860B'],['Simulator (Student)','sim_student','var(--muted)'],
+        ['Night','night','#60A5FA'],['Actual IFR','ifr','var(--purple)'],['Sim Instrument','sim_inst','var(--purple)'],['X-Country','xc','var(--teal)'],
+      ].forEach(([l,k,col])=>rGrid.appendChild(statCard(l,totals[k],'h',col)));
+      roleWrap.appendChild(rGrid);
+      main.appendChild(roleWrap);
+
+      const typeWrap = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
+      typeWrap.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'3px'}},'Hours by Aircraft Type'));
+      typeWrap.appendChild(div({style:{fontSize:'11px',color:'var(--steel)',marginBottom:'10px'}},Object.keys(byType).length+' types flown'));
+      const tov = div({style:{overflowX:'auto'}});
+      const tt = el('table',{class:'tbl'});
+      const tth = el('thead'); const thr = el('tr');
+      ['Type','Entries','Total','PIC','Dual','Night','Ldgs'].forEach(h=>thr.appendChild(el('th',{},h)));
+      tth.appendChild(thr); tt.appendChild(tth);
+      const ttb = el('tbody');
+      const typeEntries = Object.entries(byType).sort((a,b)=>b[1].total-a[1].total);
+      typeEntries.forEach(([type,t],i)=>{
+        const tr3 = el('tr',{style:{background:i%2===0?'var(--bg)':'transparent'}});
+        [type,String(t.n),hhmm(t.total),hhmm(t.pic),hhmm(t.dual),hhmm(t.night),String(t.ldgs)].forEach((v,ci)=>{
+          tr3.appendChild(el('td',{style:{fontFamily:ci>=1?'monospace':'inherit',fontSize:'11px',fontWeight:ci===0?'700':'400'}},v));
+        });
+        ttb.appendChild(tr3);
+      });
+      const ttf = el('tfoot'); const tftr = el('tr');
+      ['TOTALS ('+typeEntries.length+')',String(typeEntries.reduce((a,[,t])=>a+t.n,0)),hhmm(typeEntries.reduce((a,[,t])=>a+t.total,0)),hhmm(typeEntries.reduce((a,[,t])=>a+t.pic,0)),hhmm(typeEntries.reduce((a,[,t])=>a+t.dual,0)),hhmm(typeEntries.reduce((a,[,t])=>a+t.night,0)),String(typeEntries.reduce((a,[,t])=>a+t.ldgs,0))].forEach(v=>tftr.appendChild(el('td',{},v)));
+      ttf.appendChild(tftr); tt.appendChild(ttb); tt.appendChild(ttf);
+      tov.appendChild(tt); typeWrap.appendChild(tov);
+      main.appendChild(typeWrap);
+    }
   }
 
   // ── DOCUMENTS TAB ──────────────────────────────────────────────────────────
