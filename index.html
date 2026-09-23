@@ -2550,25 +2550,22 @@ async function syncOfflineQueue() {
   toast('Sync complete', 'var(--green)');
 }
 
-// Register service worker - unregister old ones first
+// Register service worker. The SW itself is network-first for the app shell and
+// its precached critical dependencies (see sw.js), so it self-updates on every
+// online load without needing to be torn down and rebuilt here - doing that left
+// a window with NO active service worker at all (unregister, then a 1-second
+// delay before a new one existed), which broke fully offline cold launches.
 if ('serviceWorker' in navigator) {
-  // Unregister ALL old service workers to clear cache
-  navigator.serviceWorker.getRegistrations().then(regs => {
-    regs.forEach(reg => reg.unregister());
+  navigator.serviceWorker.register('/salogbook/sw.js').then(reg => {
+    console.log('SW registered:', reg.scope);
+  }).catch(err => {
+    console.log('SW registration failed:', err);
   });
-  // Register fresh SW after a short delay
-  setTimeout(() => {
-    navigator.serviceWorker.register('/salogbook/sw.js').then(reg => {
-      console.log('SW registered:', reg.scope);
-    }).catch(err => {
-      console.log('SW registration failed:', err);
-    });
-    navigator.serviceWorker.addEventListener('message', async e => {
-      if (e.data && e.data.type === 'SYNC_NEEDED') {
-        await syncOfflineQueue();
-      }
-    });
-  }, 1000);
+  navigator.serviceWorker.addEventListener('message', async e => {
+    if (e.data && e.data.type === 'SYNC_NEEDED') {
+      await syncOfflineQueue();
+    }
+  });
 }
 
 // Boot
