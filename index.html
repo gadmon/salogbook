@@ -1212,7 +1212,7 @@ function renderEndorseForm(initial) {
   };
   scanWrap.appendChild(scanFileInp);
   form.appendChild(scanWrap);
-  const subWrap = div({style:{marginBottom:'10px'}}); = div({style:{marginBottom:'10px'}});
+  const subWrap = div({style:{marginBottom:'10px'}});
   subWrap.appendChild(el('label',{style:{display:'block',fontSize:'10px',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:'5px'}},'Submitted to SACAA (within 30 days)'));
   const subChk = inp({type:'checkbox',style:{width:'16px',height:'16px',accentColor:'var(--green)',cursor:'pointer',marginRight:'8px'}});
   if(data.submitted) subChk.checked = true;
