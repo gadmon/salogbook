@@ -1913,10 +1913,22 @@ function render() {
     }
 
     main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
-      span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Report 1 - 12-Month Annual Summary'),
+      span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Report 1 - 12-Month Certified Summary of Hours'),
       span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.01.5(13)')
     ));
-    main.appendChild(makeReportTable(last12,'12-Month Log: '+cut12.toLocaleDateString('en-ZA')+' to '+now.toLocaleDateString('en-ZA'),last12.length+' entries'));
+    (() => {
+      const t12 = computeTotals(last12);
+      const sumWrap = div({style:{background:'var(--card)',border:'2px solid var(--sky)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
+      sumWrap.appendChild(div({style:{fontWeight:'700',fontSize:'13px',color:'var(--sky)',marginBottom:'3px'}},'Summary of Hours Flown: '+cut12.toLocaleDateString('en-ZA')+' to '+now.toLocaleDateString('en-ZA')));
+      sumWrap.appendChild(div({style:{fontSize:'11px',color:'var(--steel)',marginBottom:'10px'}},last12.length+' entries in period'));
+      const g1 = div({style:{display:'flex',gap:'7px',flexWrap:'wrap',marginBottom:'8px'}});
+      [['Total','total','h'],['Flight','flight','h'],['PIC','pic','h'],['SIC','sic','h'],['Night','night','h'],['IFR','ifr','h'],['Sim','sim','h'],['XC','xc','h']].forEach(([l,k,u])=>g1.appendChild(statCard(l,t12[k],u,'var(--sky)')));
+      sumWrap.appendChild(g1);
+      const g2 = div({style:{display:'flex',gap:'7px',flexWrap:'wrap'}});
+      [['Day Landings','day_ldgs',''],['Night Landings','night_ldgs',''],['Approaches','approaches','']].forEach(([l,k,u])=>g2.appendChild(statCard(l,Math.round(t12[k]),u,'var(--green)')));
+      sumWrap.appendChild(g2);
+      main.appendChild(sumWrap);
+    })();
 
     main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--sky)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
       span({style:{fontWeight:'700',color:'var(--sky)',fontSize:'12px'}},'Report 2 - Last 3 Pages'),
