@@ -1924,6 +1924,28 @@ function render() {
     ));
     main.appendChild(makeReportTable([...state.flights].slice(0,36),'Most Recent 36 Entries','Last 3 logbook pages'));
 
+    // Latest endorsements required for revalidation: OPC/LPC/PPC and Instrument Rating (IF)
+    const latestOpcLpcPpc = [...state.endorsements].filter(e=>e.category==='OPC / LPC'||/ppc/i.test(e.title||'')).sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
+    const latestIF = [...state.endorsements].filter(e=>e.category==='Instrument Rating').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
+    main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--amber)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
+      span({style:{fontWeight:'700',color:'var(--amber)',fontSize:'12px'}},'Latest Endorsements for Revalidation'),
+      span({style:{fontSize:'11px',color:'var(--steel)'}},'OPC / LPC / PPC and Instrument Rating (IF)')
+    ));
+    const revalWrap = div({style:{background:'var(--card)',border:'2px solid var(--amber)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
+    [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF]].forEach(([label,e])=>{
+      const row = div({style:{display:'flex',gap:'12px',padding:'8px 0',borderBottom:'1px solid var(--border)22',fontSize:'12px',flexWrap:'wrap',alignItems:'center'}});
+      row.appendChild(span({style:{color:'var(--sky)',minWidth:'190px',fontWeight:'700'}},label));
+      if (e) {
+        row.appendChild(span({style:{color:'var(--text)',flex:'1',fontWeight:'600'}},e.title||e.category));
+        if(e.date_issued) row.appendChild(span({style:{color:'var(--steel)'}},fmtDate(e.date_issued)));
+        if(e.expiry_date) row.appendChild(span({style:{color:'var(--muted)'}},'exp: '+fmtDate(e.expiry_date)));
+      } else {
+        row.appendChild(span({style:{color:'var(--red)',flex:'1'}},'No record on file - add in Endorsements tab'));
+      }
+      revalWrap.appendChild(row);
+    });
+    main.appendChild(revalWrap);
+
     main.appendChild(div({style:{background:'var(--bg)',border:'1px solid var(--green)',borderRadius:'6px',padding:'6px 12px',marginBottom:'8px',display:'flex',alignItems:'center',gap:'8px'}},
       span({style:{fontWeight:'700',color:'var(--green)',fontSize:'12px'}},'Report 3 - 90-Day Print Period'),
       span({style:{fontSize:'11px',color:'var(--steel)'}},'CAR 61.01.8(1) - print and file every 90 days')
