@@ -158,17 +158,63 @@ let state = {
 function setState(patch) { Object.assign(state, patch); render(); }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
+// Remember who was last signed in (uid + email only - no password/token) so that
+// a fully offline cold launch - or a launch where Supabase's own session refresh
+// can't reach the network - can still recognise the pilot and serve their cached
+// IndexedDB data, instead of dead-ending on the login screen with no way to
+// "sign in" offline at all.
+function cacheLastIdentity(session) {
+  try {
+    localStorage.setItem('salogbook_last_identity', JSON.stringify({uid: session.user.id, email: session.user.email}));
+  } catch(e) {}
+}
+function getCachedIdentity() {
+  try {
+    const raw = localStorage.getItem('salogbook_last_identity');
+    return raw ? JSON.parse(raw) : null;
+  } catch(e) { return null; }
+}
+let _authSettled = false;
 sb.auth.onAuthStateChange(async (event, session) => {
-  state.session = session;
+  _authSettled = true;
   if (session) {
+    state.session = session;
+    cacheLastIdentity(session);
     await loadProfile();
     await loadAll();
+  } else if (!navigator.onLine && getCachedIdentity()) {
+    // No live session (it may simply have expired while offline and the
+    // refresh call has nowhere to go) but we recognise this device/pilot and
+    // have their data cached locally - use it rather than blocking them out.
+    const cached = getCachedIdentity();
+    state.session = { user: { id: cached.uid, email: cached.email }, offline: true };
+    state.profile = state.profile || { id: cached.uid, full_name: '', licence_type: 'SPL' };
+    await loadAll();
   } else {
+    state.session = null;
     state.profile = null; state.flights = []; state.endorsements = []; state.documents = [];
   }
   state.loading = false;
   render();
 });
+// Safety net: if Supabase's own session restore hangs (e.g. it is stuck trying
+// to reach the network to refresh an expired token while offline) rather than
+// firing onAuthStateChange at all, fall back to the cached identity after a
+// short wait so an offline cold launch never gets stuck on "Loading...".
+setTimeout(() => {
+  if (_authSettled || state.session) return;
+  const cached = getCachedIdentity();
+  if (!navigator.onLine && cached) {
+    state.session = { user: { id: cached.uid, email: cached.email }, offline: true };
+    state.profile = state.profile || { id: cached.uid, full_name: '', licence_type: 'SPL' };
+    state.loading = false;
+    loadAll().then(render);
+    render();
+  } else if (!navigator.onLine) {
+    state.loading = false;
+    render();
+  }
+}, 4000);
 
 async function loadProfile() {
   const { data } = await sb.from('profiles').select('*').eq('id', state.session.user.id).single();
@@ -258,6 +304,7 @@ async function saveFlight(data) {
     }
     state.flights.sort((a,b) => b.date.localeCompare(a.date));
     toast('Saved offline - will sync when connected', 'var(--amber)');
+    _flightDraftActive = false; _flightDraftData = null;
     setState({ showFlightForm: false, editFlight: null });
     return;
   }
@@ -275,6 +322,7 @@ async function saveFlight(data) {
   }
   state.flights.sort((a,b) => b.date.localeCompare(a.date));
   toast('Flight saved');
+  _flightDraftActive = false; _flightDraftData = null;
   setState({ showFlightForm: false, editFlight: null });
 }
 
@@ -862,9 +910,21 @@ function renderAuth() {
 }
 
 // ─── FLIGHT FORM ──────────────────────────────────────────────────────────────
+// A background re-render (an auth token refresh, an online/offline flip, a
+// completed loadAll()) used to call renderFlightForm() again from scratch while
+// the form was still open, silently discarding whatever the pilot had typed so
+// far. _flightDraftData/_flightDraftActive carry the in-progress entry across
+// those incidental re-renders; only an explicit open/close (see the Cancel,
+// Save and modal-close handlers below) resets them.
+let _flightDraftData = null;
+let _flightDraftActive = false;
 function renderFlightForm(initial) {
+  let data;
+  if (_flightDraftActive && _flightDraftData) {
+    data = _flightDraftData;
+  } else {
   const f = initial ? {...initial} : {
-    id:'new', date:today(), duty_type:'Flight Duty', flight_rules:'VFR',
+    id:'new', date:today(), duty_type:'Flight Duty', flight_rules:'IFR',
     aircraft_type:'', aircraft_reg:'', dep_airport:'', arr_airport:'', route:'',
     total_time:0, sim_time:0, pic:0, sic:0, dual:0, picus:0, solo:0,
     night:0, ifr:0, sim_inst:0, xc:0,
@@ -877,7 +937,10 @@ function renderFlightForm(initial) {
     check_captain_name:'', autolands:0, catii:0, catiii:0, rnav_approaches:0, ils_approaches:0
   };
 
-  const data = {...f};
+  data = {...f};
+  _flightDraftData = data;
+  _flightDraftActive = true;
+  }
   const form = div({style:{display:'flex',flexDirection:'column',gap:'0'}});
 
   // Row helper
@@ -896,8 +959,8 @@ function renderFlightForm(initial) {
   const ni = {...si, fontFamily:'monospace'};
 
   function mkInp(key, type='text', placeholder='') {
-    const i = inp({type, placeholder, value:data[key]||'', style:type==='number'?ni:si,
-      oninput: e => { data[key] = type==='number'?parseFloat(e.target.value)||0:e.target.value; }});
+    const i = inp({type, placeholder, value:data[key]||'', style:type==='number'?ni:(type==='text'?{...si,textTransform:'uppercase'}:si),
+      oninput: e => { data[key] = type==='number'?parseFloat(e.target.value)||0:(type==='text'?e.target.value.toUpperCase():e.target.value); }});
     return i;
   }
   function mkSel(key, opts) {
@@ -924,12 +987,29 @@ function renderFlightForm(initial) {
   ));
 
   const isSim = data.duty_type === 'Simulator Duty';
+  let routeInp, returnSectorChecked = false;
+  function autoRoute() {
+    data.route = (data.dep_airport||'') + ((data.dep_airport||data.arr_airport)?'-':'') + (data.arr_airport||'');
+    if (routeInp) routeInp.value = data.route;
+  }
   if (!isSim) {
+    const depInp = inp({type:'text', placeholder:'FAJS', value:data.dep_airport||'', style:{...si,textTransform:'uppercase'},
+      oninput: e => { data.dep_airport = e.target.value.toUpperCase(); autoRoute(); }});
+    const arrInp = inp({type:'text', placeholder:'FALA', value:data.arr_airport||'', style:{...si,textTransform:'uppercase'},
+      oninput: e => { data.arr_airport = e.target.value.toUpperCase(); autoRoute(); }});
+    routeInp = inp({type:'text', placeholder:'FAJS-FALA', value:data.route||'', style:{...si,textTransform:'uppercase'},
+      oninput: e => { data.route = e.target.value.toUpperCase(); }});
     form.appendChild(row(
-      fld('From', mkInp('dep_airport','text','FAJS'),'1 0 80px'),
-      fld('To', mkInp('arr_airport','text','FALA'),'1 0 80px'),
-      fld('Route', mkInp('route','text','FAJS-FALA'),'2 0 160px')
+      fld('From', depInp,'1 0 80px'),
+      fld('To', arrInp,'1 0 80px'),
+      fld('Route (auto)', routeInp,'2 0 160px')
     ));
+    const retWrap = div({style:{display:'flex',alignItems:'center',gap:'6px',marginBottom:'10px'}});
+    const retChk = inp({type:'checkbox',style:{width:'16px',height:'16px',accentColor:'var(--green)',cursor:'pointer'}});
+    retChk.onchange = e => { returnSectorChecked = e.target.checked; };
+    retWrap.appendChild(retChk);
+    retWrap.appendChild(span({style:{fontSize:'11px',color:'var(--steel)'}},'Add Return Sector - auto-fills aircraft & crew for the next leg after saving'));
+    form.appendChild(retWrap);
   }
 
   // ── Auto-calculate block time from chocks ─────────────────────────────────
@@ -1064,18 +1144,38 @@ function renderFlightForm(initial) {
     fld('Night Ldgs', mkInp('night_landings','number','0'),'1 0 60px'),
     fld('Holds', mkInp('holds','number','0'),'1 0 55px')
   ));
-  const apchCountLabel = div({style:{fontSize:'9px',color:'var(--teal)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Approach Counts (LogTenPro summary totals)');
+  const apchCountLabel = div({style:{fontSize:'9px',color:'var(--teal)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Approach Counts (auto-calculated from Approaches below)');
   form.appendChild(apchCountLabel);
+  const roCountStyle = {...ni, background:'#F1F3F5', color:'var(--steel)', cursor:'not-allowed'};
+  let autolandsInp, catiiInp, catiiiInp, rnavInp, ilsInp;
+  autolandsInp = inp({type:'number', value:data.autolands||0, readOnly:true, style:roCountStyle});
+  catiiInp = inp({type:'number', value:data.catii||0, readOnly:true, style:roCountStyle});
+  catiiiInp = inp({type:'number', value:data.catiii||0, readOnly:true, style:roCountStyle});
+  rnavInp = inp({type:'number', value:data.rnav_approaches||0, readOnly:true, style:roCountStyle});
+  ilsInp = inp({type:'number', value:data.ils_approaches||0, readOnly:true, style:roCountStyle});
   form.appendChild(row(
-    fld('Autolands', mkInp('autolands','number','0'),'1 0 70px'),
-    fld('CAT II', mkInp('catii','number','0'),'1 0 60px'),
-    fld('CAT III', mkInp('catiii','number','0'),'1 0 60px'),
-    fld('RNAV', mkInp('rnav_approaches','number','0'),'1 0 60px'),
-    fld('ILS', mkInp('ils_approaches','number','0'),'1 0 60px')
+    fld('Autolands', autolandsInp,'1 0 70px'),
+    fld('CAT II', catiiInp,'1 0 60px'),
+    fld('CAT III', catiiiInp,'1 0 60px'),
+    fld('RNAV', rnavInp,'1 0 60px'),
+    fld('ILS', ilsInp,'1 0 60px')
   ));
+  function computeApchCounts() {
+    const list = data.approaches || [];
+    data.ils_approaches = list.filter(a => (a.type||'').startsWith('ILS')).length;
+    data.rnav_approaches = list.filter(a => /^(RNAV|RNP)/.test(a.type||'')).length;
+    data.catii = list.filter(a => a.type==='ILS Cat II' || a.type==='Autoland Cat II').length;
+    data.catiii = list.filter(a => a.type==='ILS Cat III' || a.type==='Autoland Cat III').length;
+    data.autolands = list.filter(a => (a.result||'').startsWith('Autoland') || (a.type||'').startsWith('Autoland')).length;
+    if (ilsInp) ilsInp.value = data.ils_approaches;
+    if (rnavInp) rnavInp.value = data.rnav_approaches;
+    if (catiiInp) catiiInp.value = data.catii;
+    if (catiiiInp) catiiiInp.value = data.catiii;
+    if (autolandsInp) autolandsInp.value = data.autolands;
+  }
   form.appendChild(row(
     fld('Pilot Role', (() => { const s = sel({style:{...si,cursor:'pointer'},onchange:e=>{data['pilot_role']=e.target.value;calcFromChocks();}}); [['PIC','PIC'],['SIC','SIC'],['PICUS','PICUS'],['Dual (Student)','Dual (Student)'],['PIC (Solo)','PIC (Solo)'],['Student / Trainee','Student / Trainee'],['Check Captain','Check Captain'],['Training Captain','Training Captain'],['Instructor (FI)','Instructor (FI)'],['Instructor (TRI)','Instructor (TRI)'],['Examiner (TRE)','Examiner (TRE)'],['Examiner (DFE)','Examiner (DFE)'],['Safety Pilot','Safety Pilot'],['Observer','Observer']].forEach(([v,t])=>s.appendChild(opt(v,t,data['pilot_role']===v))); return s; })(),'2 0 150px'),
-    fld('Duty Role', mkSel('duty_role',[['','None'],['Check Captain','Check Captain'],['Training Captain','Training Captain'],['Instructor (FI)','Instructor (FI)'],['Instructor (TRI)','Instructor (TRI)'],['Examiner (TRE)','Examiner (TRE)'],['Examiner (DFE)','Examiner (DFE)'],['Line Check','Line Check'],['OPC','OPC'],['LPC','LPC'],['Route Check','Route Check'],['Safety Pilot','Safety Pilot']]),'2 0 150px')
+    fld('Duty Role', mkSel('duty_role',[['','None'],['Pilot','Pilot'],['Check Captain','Check Captain'],['Training Captain','Training Captain'],['Instructor (FI)','Instructor (FI)'],['Instructor (TRI)','Instructor (TRI)'],['Examiner (TRE)','Examiner (TRE)'],['Examiner (DFE)','Examiner (DFE)'],['Line Check','Line Check'],['OPC','OPC'],['LPC','LPC'],['Route Check','Route Check'],['Safety Pilot','Safety Pilot']]),'2 0 150px')
   ));
 
   // Crew
@@ -1098,6 +1198,7 @@ function renderFlightForm(initial) {
       onclick: () => {
         data.approaches = [...(data.approaches||[]), {type:'ILS Cat I', rwy:'', airport:data.arr_airport||'', result:'Full Stop'}];
         renderApproaches();
+        computeApchCounts();
       }
     }, '+ Add')
   );
@@ -1111,36 +1212,78 @@ function renderFlightForm(initial) {
     apchList.innerHTML = '';
     (data.approaches||[]).forEach((a, i) => {
       const row2 = div({style:{display:'flex',gap:'5px',alignItems:'center',marginBottom:'4px',background:'var(--card)',borderRadius:'5px',padding:'5px 8px'}});
-      const tSel = sel({style:{...si,fontSize:'11px',flex:'0 0 120px'},onchange:e=>{data.approaches[i].type=e.target.value;}});
+      const tSel = sel({style:{...si,fontSize:'11px',flex:'0 0 120px'},onchange:e=>{data.approaches[i].type=e.target.value;computeApchCounts();}});
       apchTypes.forEach(t => tSel.appendChild(opt(t,t,a.type===t)));
       const rwyInp = inp({type:'text',placeholder:'RWY',value:a.rwy||'',style:{...si,fontSize:'11px',flex:'0 0 60px'},oninput:e=>{data.approaches[i].rwy=e.target.value;}});
       const aptInp = inp({type:'text',placeholder:'ICAO',value:a.airport||'',style:{...si,fontSize:'11px',flex:'0 0 60px',textTransform:'uppercase'},oninput:e=>{data.approaches[i].airport=e.target.value.toUpperCase();}});
-      const resSel = sel({style:{...si,fontSize:'11px',flex:'1'},onchange:e=>{data.approaches[i].result=e.target.value;}});
+      const resSel = sel({style:{...si,fontSize:'11px',flex:'1'},onchange:e=>{data.approaches[i].result=e.target.value;computeApchCounts();}});
       apchResults.forEach(r => resSel.appendChild(opt(r,r,a.result===r)));
       const delBtn = btn({style:{background:'none',border:'none',color:'var(--muted)',cursor:'pointer',fontSize:'16px',padding:'0 4px'},
-        onclick:()=>{data.approaches.splice(i,1);renderApproaches();}}, 'x');
+        onclick:()=>{data.approaches.splice(i,1);renderApproaches();computeApchCounts();}}, 'x');
       [tSel,rwyInp,aptInp,resSel,delBtn].forEach(x=>row2.appendChild(x));
       apchList.appendChild(row2);
     });
   }
   renderApproaches();
+  computeApchCounts();
 
   // Lesson & remarks
   form.appendChild(row(fld('Lesson / Exercise', mkInp('lesson','text','Exercise 12 / Solo Nav / Instrument'))));
   const rmkWrap = div({class:'field'});
   rmkWrap.appendChild(el('label',{style:{display:'block',fontSize:'9px',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:'3px'}},'Remarks'));
-  const rmkTA = el('textarea',{rows:'3',style:{...si,resize:'vertical',width:'100%',fontFamily:'system-ui',fontSize:'12px'}});
+  const rmkTA = el('textarea',{rows:'3',style:{...si,resize:'vertical',width:'100%',fontFamily:'system-ui',fontSize:'12px',textTransform:'uppercase'}});
   rmkTA.value = data.remarks||'';
-  rmkTA.oninput = e => { data.remarks = e.target.value; };
+  rmkTA.oninput = e => { data.remarks = e.target.value.toUpperCase(); };
   rmkWrap.appendChild(rmkTA);
   form.appendChild(rmkWrap);
 
   // Buttons
+  function blankFlight() {
+    return {
+      id:'new', date:data.date, duty_type:data.duty_type, flight_rules:data.flight_rules,
+      aircraft_type:'', aircraft_reg:'', dep_airport:'', arr_airport:'', route:'',
+      total_time:0, sim_time:0, pic:0, sic:0, dual:0, picus:0, solo:0,
+      night:0, ifr:0, sim_inst:0, xc:0,
+      day_landings:0, night_landings:0, day_takeoffs:0, night_takeoffs:0, holds:0,
+      chocks_off:'', chocks_on:'',
+      pilot_role:'', duty_role:'', p1_name:'', p2_name:'', instructor:'',
+      lesson:'', remarks:'', approaches:[],
+      flight_number:'', actual_inst:0, p1us:0, p1us_night:0, dual_given:0, relief:0,
+      relief_crew_name:'', sfi_sfe:0, on_duty:'', off_duty:'', pilot_flying:false,
+      check_captain_name:'', autolands:0, catii:0, catiii:0, rnav_approaches:0, ils_approaches:0
+    };
+  }
   const btns = div({style:{display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'12px'}});
   btns.appendChild(btn({style:{background:'none',border:'1px solid var(--border)',color:'var(--steel)',borderRadius:'8px',padding:'8px 18px',fontSize:'13px',cursor:'pointer'},
-    onclick:()=>setState({showFlightForm:false,editFlight:null})},'Cancel'));
+    onclick:()=>{_flightDraftActive=false;_flightDraftData=null;setState({showFlightForm:false,editFlight:null});}},'Cancel'));
   btns.appendChild(btn({style:{background:'var(--green)',border:'none',color:'var(--gold)',borderRadius:'8px',padding:'8px 18px',fontSize:'13px',fontWeight:'700',cursor:'pointer'},
-    onclick:async()=>{ try{ await saveFlight(data); }catch(e){ toast('Error: '+e.message,'var(--red)'); } }},'Save Flight'));
+    onclick:async()=>{
+      try{
+        const wantReturn = returnSectorChecked;
+        const rd = wantReturn ? blankFlight() : null;
+        if (rd) {
+          rd.aircraft_type = data.aircraft_type;
+          rd.aircraft_reg = data.aircraft_reg;
+          rd.dep_airport = data.arr_airport;
+          rd.arr_airport = data.dep_airport;
+          rd.route = (data.arr_airport||'') + ((data.dep_airport||data.arr_airport)?'-':'') + (data.dep_airport||'');
+          rd.pilot_role = data.pilot_role;
+          rd.duty_role = data.duty_role;
+          rd.p1_name = data.p1_name;
+          rd.p2_name = data.p2_name;
+          rd.instructor = data.instructor;
+          rd.relief_crew_name = data.relief_crew_name;
+          rd.check_captain_name = data.check_captain_name;
+          rd.flight_number = data.flight_number;
+          rd.pilot_flying = data.pilot_flying;
+        }
+        await saveFlight(data);
+        if (rd) {
+          setState({ showFlightForm:true, editFlight: rd });
+          toast('Return sector ready - fill in times and save');
+        }
+      }catch(e){ toast('Error: '+e.message,'var(--red)'); }
+    }},'Save Flight'));
   form.appendChild(btns);
 
   return form;
@@ -2191,7 +2334,7 @@ function render() {
 
   // ── MODALS ─────────────────────────────────────────────────────────────────
   if (state.showFlightForm) {
-    app.appendChild(modal(state.editFlight?'Edit Flight Entry':'New Flight Entry', renderFlightForm(state.editFlight), ()=>setState({showFlightForm:false,editFlight:null}), true));
+    app.appendChild(modal((state.editFlight&&state.editFlight.id&&state.editFlight.id!=='new')?'Edit Flight Entry':'New Flight Entry', renderFlightForm(state.editFlight), ()=>{_flightDraftActive=false;_flightDraftData=null;setState({showFlightForm:false,editFlight:null});}, true));
   }
 
   // AI Document Scanner Modal
