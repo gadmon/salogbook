@@ -1129,6 +1129,12 @@ function renderFlightForm(initial) {
       // is unrecognised, so a manual entry is never silently overwritten.
       const nightCalc = computeNightHours(data.dep_airport, data.arr_airport, data.date, data.chocks_off, data.chocks_on, blockTime);
       if (nightCalc !== null) data.night = nightCalc;
+      // Cross-country: landing at a point other than departure. Auto-set once
+      // both airports are entered; leave untouched (don't force to 0) until
+      // then, so an in-progress entry isn't zeroed before you've typed To yet.
+      if (data.dep_airport && data.arr_airport) {
+        data.xc = (data.dep_airport !== data.arr_airport) ? blockTime : 0;
+      }
     }
 
     // Update the displayed time inputs
@@ -1142,6 +1148,7 @@ function renderFlightForm(initial) {
     if (simInstInp) simInstInp.value = data.sim_inst || 0;
     if (sfiSfeInp) sfiSfeInp.value = data.sfi_sfe || 0;
     if (nightInp) nightInp.value = data.night || 0;
+    if (xcInp) xcInp.value = data.xc || 0;
 
     // Show the calculated banner
     const calcBanner = document.getElementById('calc-banner');
@@ -1192,7 +1199,7 @@ function renderFlightForm(initial) {
   form.appendChild(calcBannerEl);
 
   // Times - with stored references for auto-update
-  let totalInp, simInp, simInstInp, sfiSfeInp, nightInp;
+  let totalInp, simInp, simInstInp, sfiSfeInp, nightInp, xcInp;
   const timeLabel = div({style:{fontSize:'9px',color:'#0066CC',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Time Breakdown (auto-filled from chocks)');
   form.appendChild(timeLabel);
 
@@ -1211,7 +1218,7 @@ function renderFlightForm(initial) {
     fld('Dual', mkInp('dual','number','0.0'),'1 0 70px'),
     fld('Night (auto)', (nightInp = mkInp('night','number','0.0')),'1 0 70px'),
     fld('Actual IFR', mkInp('ifr','number','0.0'),'1 0 70px'),
-    fld('X-Country', mkInp('xc','number','0.0'),'1 0 70px')
+    fld('X-Country (auto)', (xcInp = mkInp('xc','number','0.0')),'1 0 70px')
   ));
   const extraTimeLabel = div({style:{fontSize:'9px',color:'#0066CC',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:'700',marginBottom:'6px',marginTop:'4px'}},'Additional Time (LogTenPro fields)');
   form.appendChild(extraTimeLabel);
