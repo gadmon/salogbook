@@ -1046,7 +1046,7 @@ function renderFlightForm(initial) {
 
   // Basics
   form.appendChild(row(
-    fld('Date', (() => { const i = mkInp('date','date'); i.addEventListener('input', () => calcFromChocks()); return i; })(),'1 0 130px'),
+    fld('Date', (() => { const i = mkInp('date','date'); i.addEventListener('input', () => calcFromChocks()); i.addEventListener('change', () => calcFromChocks()); return i; })(),'1 0 130px'),
     fld('Duty Type', (() => { const s = sel({style:{...si,cursor:'pointer'},onchange:e=>{data['duty_type']=e.target.value;calcFromChocks();}}); [['Flight Duty','Flight Duty'],['Simulator Duty','Simulator Duty'],['Ground School','Ground School'],['Check Ride','Check Ride']].forEach(([v,t])=>s.appendChild(opt(v,t,data['duty_type']===v))); return s; })(), '1 0 140px'),
     fld('Rules', mkSel('flight_rules',[['VFR','VFR'],['IFR','IFR'],['SVFR','SVFR']]), '0 0 80px')
   ));
@@ -1176,12 +1176,19 @@ function renderFlightForm(initial) {
 
   // Smart chocks input - recalculates on change
   function mkChocksInp(key) {
+    // Listen for both 'input' and 'change': some mobile browsers (notably
+    // iOS Safari/Chrome on iPad) don't reliably fire 'input' when a native
+    // time picker is adjusted via its wheel/segment UI rather than typed -
+    // without 'change' too, editing an already-filled chocks time silently
+    // failed to recalculate total time, night time, etc.
+    const onChocksChange = e => {
+      data[key] = e.target.value;
+      calcFromChocks();
+    };
     const i = inp({type:'time', value:data[key]||'',
       style:{width:'100%',background:'#FFFFFF',border:'1px solid #CED4DA',borderRadius:'6px',padding:'6px 9px',color:'#1A1A1A',fontSize:'13px',fontFamily:'monospace'},
-      oninput: e => {
-        data[key] = e.target.value;
-        calcFromChocks();
-      }
+      oninput: onChocksChange,
+      onchange: onChocksChange
     });
     return i;
   }
@@ -1585,14 +1592,14 @@ function render() {
   }
   const hi = div({class:'header-inner'});
   hi.appendChild(div({class:'hlogo'},
-    div({class:'hicon',style:{background:'#006B3F',color:'#FFB612'}},'SB'),
+    div({class:'hicon',style:{background:'var(--blue)',color:'#FFB612'}},'SB'),
     div({},
       div({style:{fontWeight:800,fontSize:14,color:'#1A1A1A'}},'SALOGBOOK'),
       div({style:{fontSize:9,color:'var(--muted)',letterSpacing:'.07em'}},(state.profile?.full_name||'').toUpperCase() + ' - ' + state.flights.length + ' ENTRIES')
     )
   ));
   const hbtns = div({style:{display:'flex',gap:'6px'}});
-  hbtns.appendChild(btn({style:{background:'#006B3F',border:'none',color:'#FFB612',borderRadius:'7px',padding:'6px 13px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>setState({showFlightForm:true,editFlight:null})}, '+ Entry'));
+  hbtns.appendChild(btn({style:{background:'var(--blue)',border:'none',color:'#FFB612',borderRadius:'7px',padding:'6px 13px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>setState({showFlightForm:true,editFlight:null})}, '+ Entry'));
   hbtns.appendChild(btn({style:{background:'none',border:'1px solid #CED4DA',color:'#555555',borderRadius:'7px',padding:'6px 11px',fontSize:'12px',cursor:'pointer'},onclick:signOut},'Sign Out'));
   hi.appendChild(hbtns);
   header.appendChild(hi);
