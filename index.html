@@ -20,22 +20,38 @@
     }
     body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;-webkit-text-size-adjust:100%;min-height:100vh}
     #app{min-height:100vh}
-    /* Auth screen */
-    .auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:linear-gradient(135deg,#E8F0F8,#F0F7FF)}
-    .auth-card{background:var(--surf);border:1px solid var(--border);border-radius:14px;padding:32px 28px;width:100%;max-width:400px}
-    .auth-logo{display:flex;align-items:center;gap:12px;margin-bottom:28px}
-    .auth-icon{width:48px;height:48px;border-radius:11px;background:#006B3F;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:900;color:#FFB612;letter-spacing:-1px}
-    .auth-title{font-size:20px;font-weight:800;color:var(--text)}
-    .auth-sub{font-size:11px;color:var(--steel);margin-top:2px}
+    /* Auth screen - modernised: soft layered gradient backdrop, elevated
+       floating card (shadow instead of a flat border), blue accent (matching
+       the header) in place of the old green/gold, rounder fields and buttons.
+       Scoped to .auth-card so the shared .field/.btn rules used elsewhere in
+       the app (Profile, imports, uploads) are left exactly as they were. */
+    .auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;
+      background:radial-gradient(circle at 18% 20%,rgba(0,102,204,.12),transparent 42%),
+                  radial-gradient(circle at 85% 80%,rgba(0,102,204,.08),transparent 45%),
+                  linear-gradient(160deg,#EEF4FC 0%,#F8FBFF 55%,#FFFFFF 100%)}
+    .auth-card{background:var(--surf);border:1px solid rgba(222,226,230,.55);border-radius:20px;padding:36px 30px;width:100%;max-width:400px;
+      box-shadow:0 24px 60px -20px rgba(0,51,102,.22),0 2px 8px rgba(0,0,0,.05)}
+    .auth-logo{display:flex;align-items:center;gap:14px;margin-bottom:30px}
+    .auth-icon{width:50px;height:50px;border-radius:14px;background:linear-gradient(135deg,#0078E0,#004C99);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:900;color:#FFB612;letter-spacing:-1px;box-shadow:0 8px 18px -4px rgba(0,102,204,.45)}
+    .auth-title{font-size:21px;font-weight:800;color:var(--text);letter-spacing:-.2px}
+    .auth-sub{font-size:11px;color:var(--steel);margin-top:3px}
     .field{margin-bottom:14px}
     .field label{display:block;font-size:10px;color:var(--steel);text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}
     .field input,.field select,.field textarea{width:100%;background:#FFFFFF;border:1px solid #CED4DA;border-radius:6px;padding:9px 12px;color:#1A1A1A;font-size:14px;outline:none;font-family:inherit;transition:border-color .15s}
     .field input:focus,.field select:focus{border-color:#0066CC;box-shadow:0 0 0 2px rgba(0,102,204,.1)}
+    .auth-card .field{margin-bottom:16px}
+    .auth-card .field input,.auth-card .field select,.auth-card .field textarea{border-radius:10px;padding:11px 13px;border-color:#D7DCE1;transition:border-color .15s,box-shadow .15s}
+    .auth-card .field input:focus,.auth-card .field select:focus{box-shadow:0 0 0 3px rgba(0,102,204,.12)}
     .btn{width:100%;padding:11px;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;transition:opacity .15s}
     .btn-primary{background:var(--green);color:var(--gold)}
     .btn-secondary{background:var(--card);color:var(--steel);border:1px solid var(--border)}
     .btn:hover{opacity:.9}
     .btn:disabled{opacity:.5;cursor:not-allowed}
+    .auth-card .btn{border-radius:11px;transition:opacity .15s,transform .15s,box-shadow .15s}
+    .auth-card .btn:hover{transform:translateY(-1px)}
+    .auth-card .btn:active{transform:translateY(0)}
+    .auth-card .btn-primary{background:linear-gradient(135deg,#0078E0,#0055AA);color:#FFFFFF;box-shadow:0 10px 22px -6px rgba(0,102,204,.5)}
+    .auth-card .btn-secondary{background:transparent;border:1px solid #DEE2E6}
     .err{background:#E8334A22;border:1px solid #E8334A55;border-radius:6px;padding:9px 12px;font-size:12px;color:#F87171;margin-bottom:12px}
     .ok{background:#006B3F22;border:1px solid #006B3F55;border-radius:6px;padding:9px 12px;font-size:12px;color:#4ADE80;margin-bottom:12px}
     /* Main app */
@@ -1555,7 +1571,7 @@ function render() {
 
   if (state.loading) {
     const ld = div({style:{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:'16px'}});
-    ld.appendChild(div({class:'auth-icon',style:{width:'56px',height:'56px',borderRadius:'14px',fontSize:'22px',fontWeight:'900',background:'var(--green)',display:'flex',alignItems:'center',justifyContent:'center',color:'var(--gold)'}},'SB'));
+    ld.appendChild(div({class:'auth-icon',style:{width:'56px',height:'56px',borderRadius:'14px',fontSize:'22px',fontWeight:'900',background:'linear-gradient(135deg,#0078E0,#004C99)',display:'flex',alignItems:'center',justifyContent:'center',color:'#FFB612'}},'SB'));
     ld.appendChild(div({style:{color:'var(--steel)',fontFamily:'monospace',fontSize:'12px'}},'Loading...'));
     app.appendChild(ld);
     return;
