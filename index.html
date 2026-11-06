@@ -237,7 +237,7 @@ function toast(msg, col='var(--green)') {
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let state = {
   session: null, profile: null, flights: [], endorsements: [], documents: [],
-  tab: 'log', loading: true, authMode: 'login',
+  tab: 'now', loading: true, authMode: 'login',
   reportType: 'revalidation',
   showFlightForm: false, editFlight: null, viewFlight: null,
   showEndorseForm: false, editEndorse: null, showAIScan: false,
@@ -1565,6 +1565,410 @@ function renderImport() {
 }
 
 // ─── MAIN RENDER ──────────────────────────────────────────────────────────────
+// ─── CURRENCY ENGINE ─────────────────────────────────────────────────────────
+// Data-driven recency/currency rules. A "rule" describes ONE requirement; a
+// "profile" is a preset list of rule ids (PPL, PPL+IR, CPL, Airline Part 121).
+// Pilots can switch profile and toggle individual rules; the choice is kept in
+// localStorage (per user, per device) so no database change is needed.
+//
+// IMPORTANT: the numbers below are a starting point for SACAA CAR Part 61 /
+// SA-CATS 61 - every rule carries `verify:true` where the figure should be
+// checked against the current regulation or the pilot's own operations manual.
+// The app is a tracking aid, never a substitute for the regulation.
+
+const CUR_DAY_MS = 86400000;
+
+// ---- helpers ---------------------------------------------------------------
+const curIsSimOnly = f => (f.total_time||0) === 0 && (f.sim_time||0) > 0;
+const curMoves = (f, kind) => kind === 'to'
+  ? (f.day_takeoffs||0) + (f.night_takeoffs||0)
+  : (f.day_landings||0) + (f.night_landings||0);
+const curDaysBetween = (a, b) => Math.floor((a - b) / CUR_DAY_MS);
+const curParse = s => s ? new Date(s.length === 10 ? s + 'T00:00:00' : s) : null;
+
+// Days left before a rolling window requirement lapses: walk the most recent
+// qualifying flights (newest first) until `required` is reached; that flight is
+// the "anchor" - it ages out of the window `windowDays` after it was flown.
+function curDaysToLapse(sortedDesc, getVal, required, windowDays, now) {
+  let cum = 0;
+  for (const f of sortedDesc) {
+    cum += getVal(f);
+    if (cum >= required) return Math.max(0, windowDays - curDaysBetween(now, curParse(f.date)));
+  }
+  return null;
+}
+
+// ---- rule catalogue ---------------------------------------------------------
+// type 'count'  : N events within a rolling window
+// type 'expiry' : an endorsement/profile date that must not have passed
+// type 'since'  : an event (e.g. OPC) that must have happened within N days
+const CUR_RULES = {
+  pax_day: {
+    type:'count', label:'Passengers - day', reg:'CAR 61.01.8', window:90, required:3, realOnly:true,
+    note:'3 take-offs and landings in the preceding 90 days to carry passengers. SACAA requires these in the same category/class (or type) - see the per-type breakdown below.',
+    verify:true,
+    val:f => Math.min(curMoves(f,'to'), curMoves(f,'ldg')),
+    // Counting the smaller of take-offs and landings per flight keeps a flight
+    // with 2 landings and 0 take-offs (a data-entry slip) from over-counting.
+  },
+  pax_night: {
+    type:'count', label:'Passengers - night', reg:'CAR 61.01.8', window:90, required:3, realOnly:true,
+    note:'3 night take-offs and landings in the preceding 90 days to carry passengers at night. Requires a valid night rating.',
+    verify:true,
+    val:f => Math.min(f.night_takeoffs||0, f.night_landings||0),
+  },
+  af_to: {
+    type:'count', label:'Take-offs (day or night)', reg:'Part 121 ops', window:90, required:3,
+    note:'Minimum 3 take-offs in the preceding 90 days, day or night combined (airline operations).',
+    val:f => curMoves(f,'to'),
+  },
+  af_ldg: {
+    type:'count', label:'Landings (day or night)', reg:'Part 121 ops', window:90, required:3,
+    note:'Minimum 3 landings in the preceding 90 days, day or night combined (airline operations).',
+    val:f => curMoves(f,'ldg'),
+  },
+  af_a330: {
+    type:'count', label:'A330/A340 landing', reg:'Part 121 ops', window:90, required:1,
+    note:'At least 1 landing in either A330 (A333) or A340 (A343/A346) in the preceding 90 days.',
+    filter:f => ['A333','A343','A346'].some(t => (f.aircraft_type||'').includes(t)),
+    val:f => curMoves(f,'ldg'),
+  },
+  af_apch_total: {
+    type:'count', label:'Instrument approaches (total)', reg:'Part 121 ops', window:90, required:2,
+    note:'At least 2 instrument approaches (ILS, RNAV/RNP, CAT II, CAT III) in the preceding 90 days.',
+    val:f => (f.ils_approaches||0)+(f.rnav_approaches||0)+(f.catii||0)+(f.catiii||0),
+  },
+  af_apch_prec: {
+    type:'count', label:'Precision approach', reg:'Part 121 ops', window:90, required:1,
+    note:'At least 1 precision approach (ILS, CAT II or CAT III) in the preceding 90 days.',
+    val:f => (f.ils_approaches||0)+(f.catii||0)+(f.catiii||0),
+  },
+  af_rnp: {
+    type:'count', label:'RNP approach', reg:'Part 121 ops', window:90, required:1,
+    note:'At least 1 RNP approach in the preceding 90 days.',
+    val:f => (f.rnav_approaches||0),
+  },
+  af_cat23: {
+    type:'count', label:'CAT II / III approach', reg:'Part 121 ops', window:90, required:1,
+    note:'At least 1 CAT II or CAT III approach in the preceding 90 days.',
+    val:f => (f.catii||0)+(f.catiii||0),
+  },
+  opc: {
+    type:'since', label:'OPC / LPC', reg:'CAR 61.12', window:180,
+    note:'Operator proficiency check every 6 months. Add it in the Endorsements tab (category OPC / LPC).',
+    find:(E) => curLatest(E, 'OPC / LPC', 'date_issued'),
+  },
+  medical: {
+    type:'expiry', label:'Medical certificate', reg:'SA-CAR Part 67',
+    note:'Uses the expiry date from your latest Medical Certificate endorsement, or the expiry on your Profile.',
+    find:(E, P) => {
+      const e = curLatest(E, 'Medical Certificate', 'expiry_date');
+      const pe = P && P.medical_expiry ? {date:P.medical_expiry, title:'Profile medical ('+(P.medical_class||'')+')'} : null;
+      if (e && pe) return e.date >= pe.date ? e : pe;
+      return e || pe;
+    },
+  },
+  night_rating: {
+    type:'expiry', label:'Night rating', reg:'CAR 61.04 (Night)', optionalNoExpiry:true,
+    note:'Shown as valid if recorded in Endorsements. A night rating normally has no expiry date.',
+    find:(E) => curLatest(E, 'Night Rating', 'date_issued', true),
+  },
+  ir: {
+    type:'expiry', label:'Instrument rating validity', reg:'CAR 61.04 / IR', verify:true,
+    note:'Uses the expiry date on your latest Instrument Rating endorsement.',
+    find:(E) => curLatest(E, 'Instrument Rating', 'expiry_date'),
+  },
+  class_rating: {
+    type:'expiry', label:'Class / type rating validity', reg:'CA 61-09.7 / 61-09.8', verify:true,
+    note:'Uses the expiry date on your latest Type / Class Rating endorsement.',
+    find:(E) => curLatest(E, 'Type / Class Rating', 'expiry_date'),
+  },
+  skills_test: {
+    type:'expiry', label:'Skills test / licence validity', reg:'CAR 61.06', verify:true,
+    note:'Uses the expiry date on your latest Skills Test or PPL/Licence endorsement.',
+    find:(E) => {
+      const a = curLatest(E, 'Skills Test', 'expiry_date'), b = curLatest(E, 'PPL / Licence', 'expiry_date');
+      if (a && b) return a.date >= b.date ? a : b;
+      return a || b;
+    },
+  },
+};
+
+// Latest endorsement of a category. `byField` is the date used for sorting and
+// for the returned `.date`. With `allowNoExpiry`, an endorsement with no expiry
+// counts as valid (date = far future) so the rule reads "valid".
+function curLatest(E, category, byField, allowNoExpiry) {
+  const list = (E||[]).filter(e => e.category === category);
+  if (!list.length) return null;
+  list.sort((a,b) => (b[byField]||'').localeCompare(a[byField]||''));
+  const e = list[0];
+  if (allowNoExpiry && !e.expiry_date) return {date:'9999-12-31', title:e.title, noExpiry:true, issued:e.date_issued};
+  return {date: e[byField], title: e.title, issued: e.date_issued};
+}
+
+// ---- profiles -----------------------------------------------------------------
+const CUR_PROFILES = {
+  ppl:     {label:'PPL - private pilot',            rules:['medical','skills_test','class_rating','pax_day']},
+  ppl_night:{label:'PPL + night rating',            rules:['medical','skills_test','class_rating','night_rating','pax_day','pax_night']},
+  ppl_ir:  {label:'PPL + night + instrument rating', rules:['medical','skills_test','class_rating','night_rating','ir','pax_day','pax_night']},
+  cpl:     {label:'CPL / instructor / charter',      rules:['medical','skills_test','class_rating','night_rating','ir','pax_day','pax_night','opc']},
+  airline: {label:'Airline (Part 121) - SAA style',  rules:['medical','opc','af_to','af_ldg','af_a330','af_apch_total','af_apch_prec','af_rnp','af_cat23']},
+};
+
+function curDefaultProfileId(profile) {
+  const t = profile && profile.licence_type;
+  if (t === 'ATPL') return 'airline';
+  if (t === 'CPL') return 'cpl';
+  return 'ppl_night';
+}
+
+// Per-user choice, stored locally. Shape: {profileId, off:[ruleIds switched off], on:[extra rule ids]}
+function curLoadPrefs(userId, profile) {
+  try {
+    const raw = localStorage.getItem('salogbook_cur_prefs_' + userId);
+    if (raw) { const p = JSON.parse(raw); if (CUR_PROFILES[p.profileId]) return p; }
+  } catch (e) {}
+  return {profileId: curDefaultProfileId(profile), off: [], on: []};
+}
+function curSavePrefs(userId, prefs) {
+  try { localStorage.setItem('salogbook_cur_prefs_' + userId, JSON.stringify(prefs)); } catch (e) {}
+}
+function curActiveRuleIds(prefs) {
+  const base = CUR_PROFILES[prefs.profileId].rules.filter(id => !(prefs.off||[]).includes(id));
+  (prefs.on||[]).forEach(id => { if (CUR_RULES[id] && !base.includes(id)) base.push(id); });
+  return base;
+}
+
+// ---- evaluation -------------------------------------------------------------
+// Returns one item per rule:
+//   {id,label,reg,note,verify,type,status:'ok'|'warn'|'bad'|'none',
+//    current,required,daysLeft,detail}
+// `status` is the traffic light; `none` = no data to judge (e.g. no medical recorded).
+function curEvaluate(ruleIds, flights, endorsements, profile, now) {
+  now = now || new Date();
+  const out = [];
+  for (const id of ruleIds) {
+    const r = CUR_RULES[id]; if (!r) continue;
+    const item = {id, label:r.label, reg:r.reg, note:r.note, verify:!!r.verify, type:r.type,
+                  status:'none', current:null, required:null, daysLeft:null, detail:''};
+    if (r.type === 'count') {
+      const cut = new Date(now.getTime() - r.window * CUR_DAY_MS);
+      let pool = flights.filter(f => curParse(f.date) >= cut);
+      if (r.realOnly) pool = pool.filter(f => !curIsSimOnly(f));
+      if (r.filter) pool = pool.filter(r.filter);
+      pool.sort((a,b) => (b.date||'').localeCompare(a.date||''));
+      const cur = pool.reduce((a,f) => a + r.val(f), 0);
+      item.current = cur; item.required = r.required;
+      item.daysLeft = cur >= r.required ? curDaysToLapse(pool, r.val, r.required, r.window, now) : null;
+      item.status = cur < r.required ? 'bad' : (item.daysLeft !== null && item.daysLeft <= 14 ? 'warn' : 'ok');
+      item.detail = cur + ' / ' + r.required + ' in last ' + r.window + ' days';
+    } else if (r.type === 'since') {
+      const ev = r.find(endorsements, profile);
+      if (!ev || !ev.date) { item.status = 'none'; item.detail = 'Not recorded'; }
+      else {
+        const age = curDaysBetween(now, curParse(ev.date));
+        item.daysLeft = r.window - age;
+        item.status = item.daysLeft < 0 ? 'bad' : (item.daysLeft <= 30 ? 'warn' : 'ok');
+        item.detail = (ev.title||'') + ' - ' + age + ' days ago';
+        item.date = ev.date;
+      }
+    } else if (r.type === 'expiry') {
+      const ev = r.find(endorsements, profile);
+      if (!ev || !ev.date) { item.status = 'none'; item.detail = 'Not recorded - add in Endorsements'; }
+      else if (ev.noExpiry) { item.status = 'ok'; item.detail = (ev.title||'Recorded') + ' - no expiry'; }
+      else {
+        item.daysLeft = Math.ceil((curParse(ev.date) - now) / CUR_DAY_MS);
+        item.status = item.daysLeft < 0 ? 'bad' : (item.daysLeft <= 30 ? 'warn' : 'ok');
+        item.detail = 'Expires ' + ev.date + (item.daysLeft >= 0 ? ' (' + item.daysLeft + ' days)' : ' - EXPIRED');
+        item.date = ev.date;
+      }
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+// Passenger-carrying currency broken down by aircraft type, for every type flown
+// in the last 12 months (SACAA ties recent experience to category/class/type).
+function curPerType(flights, now) {
+  now = now || new Date();
+  const cut90 = new Date(now.getTime() - 90 * CUR_DAY_MS);
+  const cut365 = new Date(now.getTime() - 365 * CUR_DAY_MS);
+  const types = {};
+  flights.filter(f => !curIsSimOnly(f) && f.aircraft_type && curParse(f.date) >= cut365).forEach(f => {
+    const t = f.aircraft_type;
+    if (!types[t]) types[t] = {type:t, day:0, night:0, last:f.date, flights:[]};
+    if (f.date > types[t].last) types[t].last = f.date;
+    types[t].flights.push(f);
+  });
+  return Object.values(types).map(t => {
+    const recent = t.flights.filter(f => curParse(f.date) >= cut90);
+    t.day = recent.reduce((a,f) => a + CUR_RULES.pax_day.val(f), 0);
+    t.night = recent.reduce((a,f) => a + CUR_RULES.pax_night.val(f), 0);
+    const desc = [...t.flights].sort((a,b) => b.date.localeCompare(a.date));
+    t.dayDaysLeft = t.day >= 3 ? curDaysToLapse(desc.filter(f => curParse(f.date) >= cut90), CUR_RULES.pax_day.val, 3, 90, now) : null;
+    delete t.flights;
+    return t;
+  }).sort((a,b) => b.last.localeCompare(a.last));
+}
+
+// Overall traffic light + the soonest lapse, for the dashboard and header banner.
+function curSummary(items) {
+  const rank = {bad:3, warn:2, ok:1, none:0};
+  let worst = 'ok';
+  items.forEach(i => { if (rank[i.status] > rank[worst] && i.status !== 'none') worst = i.status; });
+  const lapsing = items.filter(i => i.daysLeft !== null && i.daysLeft !== undefined && i.status !== 'bad')
+                       .sort((a,b) => a.daysLeft - b.daysLeft);
+  return {
+    worst: items.length ? worst : 'none',
+    bad: items.filter(i => i.status === 'bad'),
+    warn: items.filter(i => i.status === 'warn'),
+    none: items.filter(i => i.status === 'none'),
+    next: lapsing[0] || null,
+  };
+}
+
+
+// ─── CURRENCY UI ─────────────────────────────────────────────────────────────
+const CUR_COL = {
+  ok:   {bg:'#E8F5E9', fg:'#2E7D32', bd:'#A5D6A7', label:'CURRENT'},
+  warn: {bg:'#FFF8E1', fg:'#B26A00', bd:'#FFE082', label:'EXPIRING'},
+  bad:  {bg:'#FFEBEE', fg:'#C62828', bd:'#FFCDD2', label:'NOT CURRENT'},
+  none: {bg:'#F1F3F5', fg:'#6C757D', bd:'#DEE2E6', label:'NO DATA'},
+};
+
+function curPrefs() {
+  if (!state.curPrefs) state.curPrefs = curLoadPrefs(state.session.user.id, state.profile);
+  return state.curPrefs;
+}
+function curSetPrefs(p) {
+  state.curPrefs = p;
+  curSavePrefs(state.session.user.id, p);
+  render();
+}
+function curItems() {
+  return curEvaluate(curActiveRuleIds(curPrefs()), state.flights, state.endorsements, state.profile, new Date());
+}
+
+function curChip(status) {
+  const c = CUR_COL[status];
+  return el('span', {style:{background:c.bg, color:c.fg, border:'1px solid '+c.bd, borderRadius:'4px', padding:'2px 9px', fontSize:'11px', fontWeight:'700', whiteSpace:'nowrap'}}, c.label);
+}
+function curDaysChip(item) {
+  if (item.daysLeft === null || item.daysLeft === undefined || item.status === 'bad') return null;
+  const c = CUR_COL[item.daysLeft <= 14 ? 'warn' : 'ok'];
+  return el('span', {style:{background:c.bg, color:c.fg, border:'1px solid '+c.bd, borderRadius:'4px', padding:'2px 8px', fontSize:'10px', fontWeight:'700', whiteSpace:'nowrap'}}, item.daysLeft + 'd to go');
+}
+
+// compact=true: one line per requirement (dashboard); false: with note + bar (Recency tab)
+function curItemRow(item, compact) {
+  const c = CUR_COL[item.status];
+  const top = div({style:{display:'flex', justifyContent:'space-between', alignItems:'center', gap:'8px', flexWrap:'wrap'}},
+    div({style:{flex:1, minWidth:'160px'}},
+      el('span', {style:{fontSize:'13px', fontWeight:'600', color:'#1A1A1A'}}, item.label),
+      item.reg ? el('span', {style:{fontSize:'10px', color:'#888', marginLeft:'8px', fontFamily:'monospace'}}, item.reg) : null,
+      item.verify ? el('span', {title:'Check this figure against the current regulation', style:{fontSize:'10px', color:'#B26A00', marginLeft:'6px'}}, '(verify)') : null
+    ),
+    div({style:{display:'flex', alignItems:'center', gap:'8px'}},
+      el('span', {style:{fontFamily:'monospace', fontSize:'12px', color:c.fg, fontWeight:'700'}}, item.detail),
+      curDaysChip(item),
+      curChip(item.status)
+    )
+  );
+  const row = div({style:{padding:'9px 0', borderBottom:'1px solid #F1F3F5'}}, top);
+  if (!compact) {
+    if (item.required) {
+      const pct = Math.min(100, (item.current / item.required) * 100);
+      row.appendChild(div({style:{background:'#E9ECEF', borderRadius:'4px', height:'6px', overflow:'hidden', marginTop:'5px', border:'1px solid #DEE2E6'}},
+        div({style:{height:'100%', width:pct+'%', background:item.status === 'bad' ? '#C62828' : (item.status === 'warn' ? '#E0A800' : '#006B3F'), transition:'width .5s'}})));
+    }
+    if (item.note) row.appendChild(div({style:{fontSize:'11px', color:'#888', marginTop:'4px', lineHeight:'1.5'}}, item.note));
+  }
+  return row;
+}
+
+function curSortedByUrgency(items) {
+  const rank = {bad:0, warn:1, none:2, ok:3};
+  return [...items].sort((a, b) => rank[a.status] - rank[b.status] || (a.daysLeft ?? 9999) - (b.daysLeft ?? 9999));
+}
+
+function curSummaryCard(items) {
+  const s = curSummary(items);
+  const worstCol = CUR_COL[s.worst === 'none' ? 'none' : s.worst];
+  let headline, sub;
+  if (!items.length) { headline = 'No requirements selected'; sub = 'Choose a profile on the Recency tab.'; }
+  else if (s.bad.length) { headline = s.bad.length + ' requirement' + (s.bad.length > 1 ? 's' : '') + ' not current'; sub = s.bad.map(i => i.label).join(' - '); }
+  else if (s.warn.length) { headline = s.warn.length + ' expiring soon'; sub = s.warn.map(i => i.label + (i.daysLeft != null ? ' (' + i.daysLeft + 'd)' : '')).join(' - '); }
+  else { headline = 'All current'; sub = s.next ? 'Next to lapse: ' + s.next.label + ' in ' + s.next.daysLeft + ' days' : 'Nothing lapsing in the tracked windows.'; }
+  if (s.none.length && !s.bad.length) sub += (sub ? ' - ' : '') + s.none.length + ' with no data recorded';
+  return div({style:{background:worstCol.bg, border:'1px solid '+worstCol.bd, borderLeft:'6px solid '+worstCol.fg, borderRadius:'10px', padding:'16px 20px', marginBottom:'14px'}},
+    div({style:{fontSize:'20px', fontWeight:'800', color:worstCol.fg}}, headline),
+    div({style:{fontSize:'12px', color:'#555', marginTop:'4px', lineHeight:'1.5'}}, sub)
+  );
+}
+
+function curPerTypeCard() {
+  const rows = curPerType(state.flights, new Date());
+  if (!rows.length) return null;
+  const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderLeft:'5px solid #0D6E6E', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}},
+    div({style:{fontWeight:'800', fontSize:'14px', color:'#1A1A1A'}}, 'Passenger currency by aircraft'),
+    div({style:{fontSize:'11px', color:'#888', marginBottom:'8px'}}, 'Types flown in the last 12 months - 3 take-offs and landings in 90 days (verify category/class rules)')
+  );
+  rows.forEach(r => {
+    const dayOk = r.day >= 3, nightOk = r.night >= 3;
+    const pill = (ok, txt) => el('span', {style:{background:ok ? '#E8F5E9' : '#FFEBEE', color:ok ? '#2E7D32' : '#C62828', border:'1px solid '+(ok ? '#A5D6A7' : '#FFCDD2'), borderRadius:'4px', padding:'2px 8px', fontSize:'11px', fontWeight:'700'}}, txt);
+    card.appendChild(div({style:{display:'flex', justifyContent:'space-between', alignItems:'center', padding:'7px 0', borderBottom:'1px solid #F1F3F5', flexWrap:'wrap', gap:'6px'}},
+      div({}, el('span', {style:{fontFamily:'monospace', fontWeight:'700', fontSize:'13px'}}, r.type), el('span', {style:{fontSize:'11px', color:'#888', marginLeft:'10px'}}, 'Last: ' + fmtDate(r.last))),
+      div({style:{display:'flex', gap:'6px', alignItems:'center'}},
+        pill(dayOk, 'Day ' + r.day + '/3'), dayOk && r.dayDaysLeft != null ? el('span', {style:{fontSize:'10px', color:'#888'}}, r.dayDaysLeft + 'd') : null,
+        pill(nightOk, 'Night ' + r.night + '/3'))
+    ));
+  });
+  return card;
+}
+
+// Profile picker + per-requirement switches
+function curPickerCard() {
+  const prefs = curPrefs();
+  const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}});
+  card.appendChild(div({style:{fontWeight:'800', fontSize:'14px', color:'#1A1A1A', marginBottom:'8px'}}, 'My currency profile'));
+  const s = sel({style:{width:'100%', maxWidth:'380px', background:'#fff', border:'1px solid #CED4DA', borderRadius:'6px', padding:'8px 12px', fontSize:'13px', cursor:'pointer'},
+    onchange:e => curSetPrefs({profileId:e.target.value, off:[], on:[]})});
+  Object.entries(CUR_PROFILES).forEach(([id, p]) => s.appendChild(opt(id, p.label, prefs.profileId === id)));
+  card.appendChild(s);
+
+  const det = el('details', {style:{marginTop:'10px'}});
+  det.appendChild(el('summary', {style:{cursor:'pointer', fontSize:'12px', color:'#0066CC'}}, 'Customise requirements'));
+  const active = curActiveRuleIds(prefs);
+  Object.entries(CUR_RULES).forEach(([id, r]) => {
+    const chk = el('input', {type:'checkbox', checked:active.includes(id), onchange:e => {
+      const base = CUR_PROFILES[prefs.profileId].rules.includes(id);
+      let off = (prefs.off || []).filter(x => x !== id), on = (prefs.on || []).filter(x => x !== id);
+      if (e.target.checked && !base) on.push(id);
+      if (!e.target.checked && base) off.push(id);
+      curSetPrefs({profileId:prefs.profileId, off, on});
+    }});
+    det.appendChild(el('label', {style:{display:'flex', alignItems:'center', gap:'8px', fontSize:'12px', padding:'4px 0', color:'#333'}}, chk, r.label, el('span', {style:{color:'#999', fontSize:'10px', fontFamily:'monospace'}}, r.reg)));
+  });
+  card.appendChild(det);
+  card.appendChild(div({style:{fontSize:'10px', color:'#999', marginTop:'8px', lineHeight:'1.5'}},
+    'Tracking aid only. Requirements are a starting point based on SACAA CAR Part 61 - always confirm against the current regulation and your operations manual. Your selection is saved on this device.'));
+  return card;
+}
+
+// Header strip shown on every tab when something needs attention
+function curBanner() {
+  if (!state.session || state.tab === 'now') return null;
+  const items = curItems();
+  const s = curSummary(items);
+  if (!s.bad.length && !s.warn.length) return null;
+  const bad = s.bad.length > 0, c = CUR_COL[bad ? 'bad' : 'warn'];
+  const txt = bad ? s.bad.length + ' requirement' + (s.bad.length > 1 ? 's' : '') + ' not current: ' + s.bad.slice(0, 3).map(i => i.label).join(', ')
+                  : s.warn.length + ' expiring soon: ' + s.warn.slice(0, 3).map(i => i.label + ' (' + i.daysLeft + 'd)').join(', ');
+  return div({style:{background:c.bg, color:c.fg, borderBottom:'1px solid '+c.bd, padding:'6px 14px', fontSize:'12px', fontWeight:'700', cursor:'pointer', textAlign:'center'}, onclick:() => setState({tab:'now'})}, txt);
+}
+
+
 function render() {
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -1621,7 +2025,7 @@ function render() {
   header.appendChild(hi);
 
   const TABS_LIST = [
-    {id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
+    {id:'now',label:'Currency'},{id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
     {id:'endorse',label:'Endorsements'},{id:'training',label:'Training'},
     {id:'recency',label:'Recency'},{id:'reports',label:'Reports'},{id:'docs',label:'Documents'},{id:'import',label:'Import'},
     {id:'profile',label:'Profile'},
@@ -1632,6 +2036,7 @@ function render() {
     tabs.appendChild(b);
   });
   header.appendChild(tabs);
+  const curBn = curBanner(); if (curBn) header.appendChild(curBn);
   app.appendChild(header);
 
   const main = div({class:'main'});
@@ -1955,223 +2360,31 @@ function render() {
   // ── REPORTS TAB ────────────────────────────────────────────────────────────
 
   // ── RECENCY TAB ─────────────────────────────────────────────────────────────
-  else if (state.tab === 'recency') {
-    const cut90 = new Date(Date.now() - 90 * 86400000);
-    const cut6m = new Date(now.getFullYear(), now.getMonth() - 6, now.getDate());
-    const last90 = state.flights.filter(f => new Date(f.date) >= cut90);
-    const last90Desc = [...last90].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
-
-    // Days remaining before a rolling 90-day requirement lapses: walks the most
-    // recent qualifying flights until the required count is reached, then
-    // returns days left until that anchor flight ages out of the 90-day window.
-    function daysToLapse(sortedDesc, getVal, required) {
-      let cum = 0;
-      for (const f of sortedDesc) {
-        cum += getVal(f);
-        if (cum >= required) {
-          const daysSince = Math.floor((now - new Date(f.date)) / 86400000);
-          return Math.max(0, 90 - daysSince);
-        }
-      }
-      return null;
-    }
-
-    // Movements in last 90 days
-    // Part 121 operations: 3 takeoffs and landings in preceding 90 days, day or night combined - no separate night-only requirement
-    const dayTO90_only   = last90.reduce((a,f)=>a+(f.day_takeoffs||0),0);
-    const nightTO90 = last90.reduce((a,f)=>a+(f.night_takeoffs||0),0);
-    const dayLdg90_only  = last90.reduce((a,f)=>a+(f.day_landings||0),0);
-    const nightLdg90= last90.reduce((a,f)=>a+(f.night_landings||0),0);
-    // Day recency includes both day AND night movements
-    const dayTO90  = dayTO90_only + nightTO90;
-    const dayLdg90 = dayLdg90_only + nightLdg90;
-    const toDaysLeft  = daysToLapse(last90Desc, f=>(f.day_takeoffs||0)+(f.night_takeoffs||0), 3);
-    const ldgDaysLeft = daysToLapse(last90Desc, f=>(f.day_landings||0)+(f.night_landings||0), 3);
-
-    // RNP and CAT II/III approach currency (Part 121) - from per-flight summary counts
-    const rnpCount90   = last90.reduce((a,f)=>a+(f.rnav_approaches||0),0);
-    const cat23Count90 = last90.reduce((a,f)=>a+(f.catii||0)+(f.catiii||0),0);
-    const rnpDaysLeft   = daysToLapse(last90Desc, f=>(f.rnav_approaches||0), 1);
-    const cat23DaysLeft = daysToLapse(last90Desc, f=>(f.catii||0)+(f.catiii||0), 1);
-
-    // A330/A340 combined type rating - at least 1 landing in either family in preceding 90 days
-    const a330a340Types = ['A333','A343','A346'];
-    const isA330A340 = f => a330a340Types.some(t=>(f.aircraft_type||'').includes(t));
-    const a330a340Ldg90    = last90.filter(isA330A340).reduce((a,f)=>a+(f.day_landings||0)+(f.night_landings||0),0);
-    const a330a340DaysLeft = daysToLapse(last90Desc.filter(isA330A340), f=>(f.day_landings||0)+(f.night_landings||0), 1);
-
-    // Approaches in last 90 days (from LogTenPro-imported per-flight summary counts)
-    const totalApchCount90 = last90.reduce((a,f)=>a+(f.ils_approaches||0)+(f.rnav_approaches||0)+(f.catii||0)+(f.catiii||0),0);
-    const precisionApchCount90 = last90.reduce((a,f)=>a+(f.ils_approaches||0)+(f.catii||0)+(f.catiii||0),0);
-    const totalApchDaysLeft = daysToLapse(last90Desc, f=>(f.ils_approaches||0)+(f.rnav_approaches||0)+(f.catii||0)+(f.catiii||0), 2);
-    const precisionApchDaysLeft = daysToLapse(last90Desc, f=>(f.ils_approaches||0)+(f.catii||0)+(f.catiii||0), 1);
-
-    // OPC from endorsements
-    const lastOPC = [...state.endorsements].filter(e=>e.category==='OPC / LPC').sort((a,b)=>(b.date_issued||'').localeCompare(a.date_issued||''))[0];
-    const opcDate = lastOPC?new Date(lastOPC.date_issued):null;
-    const opcDays = opcDate?Math.round((now-opcDate)/86400000):null;
-    const opcOk = opcDays!==null&&opcDays<=180;
-
-    // Medical from endorsements
-    const lastMed = [...state.endorsements].filter(e=>e.category==='Medical Certificate').sort((a,b)=>(b.expiry_date||'').localeCompare(a.expiry_date||''))[0];
-    const medExp = lastMed&&lastMed.expiry_date?new Date(lastMed.expiry_date):null;
-    const medDays = medExp?Math.round((medExp-now)/86400000):null;
-    const medOk = medDays!==null&&medDays>0;
-
-    // Type recency
-    const typeMap = {};
-    state.flights.forEach(f=>{
-      const t=f.aircraft_type||'Unknown';
-      if(!typeMap[t]||f.date>typeMap[t].date) typeMap[t]=f;
-    });
-
-    function badge(ok) {
-      return el('span',{style:{background:ok?'#E8F5E9':'#FFEBEE',color:ok?'#2E7D32':'#C62828',border:'1px solid '+(ok?'#A5D6A7':'#FFCDD2'),borderRadius:'4px',padding:'2px 9px',fontSize:'11px',fontWeight:'700'}},ok?'CURRENT':'LAPSED');
-    }
-
-    function pb(cur,req,col) {
-      const pct=Math.min(100,(cur/req)*100);
-      const ok=cur>=req;
-      return div({style:{background:'#E9ECEF',borderRadius:'4px',height:'6px',overflow:'hidden',marginTop:'4px',border:'1px solid #DEE2E6'}},
-        div({style:{height:'100%',width:pct+'%',background:ok?'#006B3F':(col||'#0066CC'),borderRadius:'4px',transition:'width .5s'}})
-      );
-    }
-
-    function daysBadge(daysLeft) {
-      if (daysLeft===null || daysLeft===undefined) return null;
-      const c = daysLeft>14?{bg:'#E8F5E9',fg:'#2E7D32',bd:'#A5D6A7'}:daysLeft>3?{bg:'#FFF8E1',fg:'#F57F17',bd:'#FFE082'}:{bg:'#FFEBEE',fg:'#C62828',bd:'#FFCDD2'};
-      return el('span',{style:{background:c.bg,color:c.fg,border:'1px solid '+c.bd,borderRadius:'4px',padding:'2px 8px',fontSize:'10px',fontWeight:'700',whiteSpace:'nowrap'}},daysLeft+'d to go');
-    }
-
-    function rItem(label,reg,cur,req,unit,note,ok,col,daysLeft) {
-      return div({style:{padding:'9px 0',borderBottom:'1px solid #F5F5F5'}},
-        div({style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'8px',marginBottom:'3px',flexWrap:'wrap'}},
-          div({style:{flex:1}},
-            el('span',{style:{fontSize:'13px',color:'#1A1A1A',fontWeight:'600'}},label),
-            reg?el('span',{style:{fontSize:'10px',color:'#888',marginLeft:'8px',fontFamily:'monospace'}},reg):null
-          ),
-          div({style:{display:'flex',alignItems:'center',gap:'8px',flexShrink:0}},
-            el('span',{style:{fontFamily:'monospace',fontSize:'13px',fontWeight:'800',color:ok?'#006B3F':(col||'#0066CC')}},String(cur)+' / '+String(req)+unit),
-            ok?daysBadge(daysLeft):null,
-            badge(ok)
-          )
-        ),
-        pb(cur,req,col),
-        note?div({style:{fontSize:'11px',color:'#888',marginTop:'3px',lineHeight:'1.5'}},note):null
-      );
-    }
-
-    function section(title,reg,col,children) {
-      return div({style:{background:'#FFFFFF',border:'1px solid #DEE2E6',borderLeft:'5px solid '+col,borderRadius:'8px',padding:'14px 18px',marginBottom:'14px',boxShadow:'0 1px 4px rgba(0,0,0,.05)'}},
-        div({style:{fontWeight:'800',fontSize:'14px',color:'#1A1A1A',marginBottom:'2px'}},title),
-        div({style:{fontSize:'11px',color:'#888',marginBottom:'10px'}},reg),
-        ...children
-      );
-    }
-
-    main.appendChild(div({style:{marginBottom:'16px'}},
-      el('h2',{style:{margin:'0 0 4px',fontSize:'18px',color:'#1A1A1A'}},'Recency & Currency'),
-      el('p',{style:{color:'#555',fontSize:'12px',margin:0}},'SACAA CAR Part 61 - Rolling 90-day windows - '+now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'}))
+  else if (state.tab === 'now') {
+    const items = curItems();
+    main.appendChild(div({style:{marginBottom:'12px'}},
+      el('h2',{style:{margin:'0 0 4px',fontSize:'18px',color:'#1A1A1A'}},'Am I current?'),
+      el('p',{style:{color:'#555',fontSize:'12px',margin:0}},CUR_PROFILES[curPrefs().profileId].label+' - '+now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'}))
     ));
-
-    // Day/Night T/O and Landings
-    main.appendChild(section('Takeoffs and Landings','Part 121 Operations - Required in preceding 90 days','#0066CC',[
-      rItem('Takeoffs','',dayTO90,3,'','Minimum 3 takeoffs in preceding 90 days, day or night combined',dayTO90>=3,null,toDaysLeft),
-      rItem('Landings','',dayLdg90,3,'','Minimum 3 landings in preceding 90 days, day or night combined',dayLdg90>=3,null,ldgDaysLeft),
-      rItem('A330/A340 Landing','',a330a340Ldg90,1,'','At least 1 landing in either A330 (A333) or A340 (A343/A346) in preceding 90 days for combined type rating currency',a330a340Ldg90>=1,null,a330a340DaysLeft),
-    ]));
-
-    // Instrument Approach Currency (Part 121) - merges total/precision/RNP/CAT II-III into one card
-    main.appendChild(section('Instrument Approach Currency','Part 121 Operations - Required in preceding 90 days','#6F42C1',[
-      rItem('Total Instrument Approaches','',totalApchCount90,2,'','At least 2 instrument approaches in preceding 90 days (ILS, RNAV/RNP, CAT II, CAT III)',totalApchCount90>=2,'#6F42C1',totalApchDaysLeft),
-      rItem('Precision Approaches','',precisionApchCount90,1,'','At least 1 precision approach (ILS, CAT II or CAT III) in preceding 90 days',precisionApchCount90>=1,'#6F42C1',precisionApchDaysLeft),
-      rItem('RNP Approaches','',rnpCount90,1,'','At least 1 RNP approach in preceding 90 days',rnpCount90>=1,'#6F42C1',rnpDaysLeft),
-      rItem('CAT II / III Approaches','',cat23Count90,1,'','At least 1 CAT II or CAT III approach in preceding 90 days',cat23Count90>=1,'#6F42C1',cat23DaysLeft),
-    ]));
-
-    // OPC/LPC
-    const opcCard = section('Operator Proficiency Check (OPC / LPC)','SA-CAR 61.12 - Required every 6 months (180 days)','#B8860B',[
-      div({style:{padding:'9px 0',borderBottom:'1px solid #F5F5F5'}},
-        div({style:{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'8px'}},
-          div({},
-            el('span',{style:{fontSize:'13px',color:'#1A1A1A',fontWeight:'600'}},'Last OPC / LPC'),
-            el('br'),
-            lastOPC
-              ? el('span',{style:{fontSize:'12px',color:'#555'}},lastOPC.title+' - '+fmtDate(lastOPC.date_issued)+(opcDays!==null?' ('+opcDays+' days ago)':''))
-              : el('span',{style:{fontSize:'12px',color:'#DC3545'}},'No OPC/LPC recorded - add in Endorsements tab')
-          ),
-          opcOk?daysBadge(Math.max(0,180-(opcDays||0))):null,
-          badge(opcOk)
-        ),
-        lastOPC?pb(Math.max(0,180-(opcDays||180)),180,'#B8860B'):null,
-        div({style:{fontSize:'11px',color:'#888',marginTop:'4px'}},'OPC/LPC required every 6 months per CAR 61.12. Record date in the Endorsements tab to track here.')
-      )
-    ]);
-    main.appendChild(opcCard);
-
-    // Medical
-    const medCard = section('Medical Certificate','SA-CAR Med 1 - Class 1 required for CPL/ATPL operations','#DC3545',[
-      div({style:{padding:'9px 0'}},
-        div({style:{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'8px'}},
-          div({},
-            el('span',{style:{fontSize:'13px',color:'#1A1A1A',fontWeight:'600'}},'Class 1 Medical Certificate'),
-            el('br'),
-            lastMed
-              ? el('span',{style:{fontSize:'12px',color:'#555'}},'Expires: '+fmtDate(lastMed.expiry_date)+(medDays!==null?' ('+(medDays>0?medDays+' days remaining':'EXPIRED')+')':''))
-              : el('span',{style:{fontSize:'12px',color:'#DC3545'}},'No medical recorded - add in Endorsements tab')
-          ),
-          badge(medOk)
-        ),
-        lastMed&&medDays!==null?pb(Math.max(0,medDays),365,'#DC3545'):null,
-        div({style:{fontSize:'11px',color:'#888',marginTop:'4px'}},'Class 1 Medical required for CPL/ATPL operations. Add expiry date in Endorsements tab to track here.')
-      )
-    ]);
-    main.appendChild(medCard);
-
-    // Type recency
-    const typeEntries = Object.entries(typeMap).sort((a,b)=>b[1].date.localeCompare(a[1].date));
-    if(typeEntries.length) {
-      const typeCard = section('Aircraft Type Currency (Last Flight by Type)','SA-CAR 61.09 - Recent experience','#0D6E6E',
-        typeEntries.map(([type,f])=>{
-          const d=Math.round((now-new Date(f.date))/86400000);
-          const ok90=d<=90; const ok180=d<=180;
-          return div({style:{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'7px 0',borderBottom:'1px solid #F5F5F5',flexWrap:'wrap',gap:'6px'}},
-            div({},
-              el('span',{style:{fontWeight:'700',color:'#1A1A1A',fontSize:'13px',fontFamily:'monospace'}},type),
-              el('span',{style:{fontSize:'11px',color:'#888',marginLeft:'10px'}},'Last: '+fmtDate(f.date)+' ('+d+' days ago)')
-            ),
-            el('span',{style:{
-              background:ok90?'#E8F5E9':ok180?'#FFF8E1':'#FFEBEE',
-              color:ok90?'#2E7D32':ok180?'#F57F17':'#C62828',
-              border:'1px solid '+(ok90?'#A5D6A7':ok180?'#FFE082':'#FFCDD2'),
-              borderRadius:'4px',padding:'2px 9px',fontSize:'11px',fontWeight:'700'
-            }},ok90?'CURRENT 90d':ok180?'CURRENT 180d':'CHECK REQS')
-          );
-        })
-      );
-      main.appendChild(typeCard);
-    }
-
-    // Summary strip
-    const summaryItems = [
-      ['Takeoffs',dayTO90>=3,dayTO90+'/3'],['Landings',dayLdg90>=3,dayLdg90+'/3'],
-      ['A330/340 Ldg',a330a340Ldg90>=1,a330a340Ldg90+'/1'],
-      ['Total Apch',totalApchCount90>=2,totalApchCount90+'/2'],
-      ['Precision Apch',precisionApchCount90>=1,precisionApchCount90+'/1'],
-      ['RNP Apch',rnpCount90>=1,rnpCount90+'/1'],['CAT II/III',cat23Count90>=1,cat23Count90+'/1'],
-      ['OPC/LPC',opcOk,opcOk?'VALID':'CHECK'],['Medical',medOk,medOk?'VALID':'CHECK'],
-    ];
-    const summary = div({style:{background:'#F8F9FA',border:'1px solid #DEE2E6',borderRadius:'8px',padding:'12px 16px',marginTop:'4px'}},
-      div({style:{fontWeight:'700',fontSize:'11px',color:'#555',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:'10px'}},'Quick Status - Last 90 Days'),
-      div({style:{display:'flex',gap:'8px',flexWrap:'wrap'}},
-        ...summaryItems.map(([label,ok,val])=>
-          div({style:{background:ok?'#E8F5E9':'#FFEBEE',border:'1px solid '+(ok?'#A5D6A7':'#FFCDD2'),borderRadius:'6px',padding:'7px 11px',textAlign:'center',minWidth:'65px'}},
-            div({style:{fontSize:'9px',color:'#555',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:'3px'}},label),
-            div({style:{fontFamily:'monospace',fontWeight:'800',fontSize:'13px',color:ok?'#2E7D32':'#C62828'}},val)
-          )        )
-      )
-    );
-    main.appendChild(summary);
+    main.appendChild(curSummaryCard(items));
+    const listCard = div({style:{background:'#fff',border:'1px solid #DEE2E6',borderRadius:'8px',padding:'6px 18px',marginBottom:'14px'}});
+    curSortedByUrgency(items).forEach(i => listCard.appendChild(curItemRow(i,true)));
+    main.appendChild(listCard);
+    const pt = curPerTypeCard(); if (pt) main.appendChild(pt);
+    main.appendChild(btn({style:{background:'none',border:'1px solid #CED4DA',color:'#0066CC',borderRadius:'7px',padding:'8px 14px',fontSize:'12px',cursor:'pointer'},onclick:()=>setState({tab:'recency'})},'Change profile / details'));
+  }
+  else if (state.tab === 'recency') {
+    const items = curItems();
+    main.appendChild(div({style:{marginBottom:'14px'}},
+      el('h2',{style:{margin:'0 0 4px',fontSize:'18px',color:'#1A1A1A'}},'Recency & Currency'),
+      el('p',{style:{color:'#555',fontSize:'12px',margin:0}},'SACAA CAR Part 61 - rolling windows - '+now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'}))
+    ));
+    main.appendChild(curPickerCard());
+    main.appendChild(curSummaryCard(items));
+    const detail = div({style:{background:'#fff',border:'1px solid #DEE2E6',borderRadius:'8px',padding:'6px 18px',marginBottom:'14px'}});
+    curSortedByUrgency(items).forEach(i => detail.appendChild(curItemRow(i,false)));
+    main.appendChild(detail);
+    const pt = curPerTypeCard(); if (pt) main.appendChild(pt);
   }
 
   else if (state.tab === 'reports') {
