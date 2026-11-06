@@ -2586,6 +2586,13 @@ function dpxParsePlan(pages) {
       s.status = (s.text.match(/\b(INTSF|WKN|NC)\b/) || [])[1] || null;
       s.coords = [...s.text.matchAll(/([NS])(\d{2})(\d{2}) ?([EW])(\d{3})(\d{2})/g)].map(c =>
         ({lat: (c[1] === 'S' ? -1 : 1) * (+c[2] + +c[3] / 60), lon: (c[4] === 'W' ? -1 : 1) * (+c[5] + +c[6] / 60)}));
+      const wi = s.text.search(/\bWI\b/);
+      if (wi >= 0) {
+        const tail = s.text.slice(wi), stop = tail.search(/\b(TOP|MOV|STNR|INTSF|WKN|NC|FCST AT)\b/);
+        const cs = [...(stop > 0 ? tail.slice(0, stop) : tail).matchAll(/([NS])(\d{2})(\d{2}) ?([EW])(\d{3})(\d{2})/g)].map(c =>
+          ({lat: (c[1] === 'S' ? -1 : 1) * (+c[2] + +c[3] / 60), lon: (c[4] === 'W' ? -1 : 1) * (+c[5] + +c[6] / 60)}));
+        s.polygon = cs.length >= 3 ? cs : null;
+      } else s.polygon = null;
       delete s.lines;
     });
   } else warnings.push('SIGMET section not found');
@@ -2640,7 +2647,75 @@ function dpxParsePlan(pages) {
     const seenId = new Set();
     out.notams = out.notams.filter(n => { const k = n.id + '|' + n.section; if (seenId.has(k)) return false; seenId.add(k); return true; });
   }
+  out.track = out.etd ? dpxParseTrack(pages, out.etd, out.eta) : null;
+  if (!out.track) warnings.push('Navlog (waypoint coordinates) not found - SIGMETs are checked by FIR timing only');
   return out;
+}
+
+// Planned track from the plan's navlog: waypoint, lat/lon, minutes after departure.
+function dpxParseTrack(pages, etd, eta) {
+  const stop = pages.findIndex(p => /^ETP #1/.test(p.lines[0] || ''));
+  const lines = pages.slice(0, stop > 0 ? stop : 6).flatMap(p => p.lines);
+  const pts = []; let last = -1;
+  for (let i = 1; i < lines.length; i++) {
+    const m = lines[i].match(/^([NS])(\d{2})(\d{2}\.\d)\/([EW])(\d{3})(\d{2}\.\d)/); if (!m) continue;
+    const prev = lines[i - 1], name = (prev.match(/^(\S+)/) || [])[1]; if (!name) continue;
+    const cm = prev.match(/(\d+):(\d+)\s*$/);
+    const min = cm ? +cm[1] * 60 + +cm[2] : (pts.length ? NaN : 0);
+    if (isNaN(min)) continue;
+    if (min < last) break;                     // the alternate's navlog restarts the clock - keep the main route only
+    last = min;
+    pts.push({name, min, lat: (m[1] === 'S' ? -1 : 1) * (+m[2] + +m[3] / 60), lon: (m[4] === 'W' ? -1 : 1) * (+m[5] + +m[6] / 60),
+              t: etd ? new Date(etd.getTime() + min * 60000) : null});
+  }
+  if (pts.length < 3) return null;
+  // ETD is off-block; the navlog clock starts at take-off. Use the plan's own ETA to place the gap (taxi) if it is sensible.
+  let off = 0; if (etd && eta) { const g = (eta - etd) / 60000 - pts[pts.length - 1].min; if (g >= 0 && g <= 40) off = g; }
+  pts.forEach(p => { p.t = etd ? new Date(etd.getTime() + (p.min + off) * 60000) : null; p.clock = p.min + off; });
+  return pts;
+}
+
+// ---- Geometry helpers (flat-earth approximations are fine at SIGMET scale) ----
+function dpxPip(pt, poly) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    if ((poly[i].lat > pt.lat) !== (poly[j].lat > pt.lat) &&
+        pt.lon < (poly[j].lon - poly[i].lon) * (pt.lat - poly[i].lat) / (poly[j].lat - poly[i].lat) + poly[i].lon) c = !c;
+  }
+  return c;
+}
+function dpxDistToPolyNM(pt, poly) {
+  const k = Math.cos(pt.lat * Math.PI / 180); let best = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const ax = (a.lon - pt.lon) * k * 60, ay = (a.lat - pt.lat) * 60, bx = (b.lon - pt.lon) * k * 60, by = (b.lat - pt.lat) * 60;
+    const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+    const u = L ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / L)) : 0;
+    best = Math.min(best, Math.hypot(ax + u * dx, ay + u * dy));
+  }
+  return best;
+}
+function dpxTrackAt(track, min) {
+  for (let i = 1; i < track.length; i++) {
+    if (min <= track[i].min) {
+      const a = track[i - 1], b = track[i], f = b.min === a.min ? 0 : (min - a.min) / (b.min - a.min);
+      return {lat: a.lat + (b.lat - a.lat) * f, lon: a.lon + (b.lon - a.lon) * f, near: f < 0.5 ? a.name : b.name};
+    }
+  }
+  const l = track[track.length - 1]; return {lat: l.lat, lon: l.lon, near: l.name};
+}
+function dpxSigmetGeometry(track, etd, s) {
+  const end = track[track.length - 1].min, off = track[0].clock - track[0].min, r = {inside: false, insideAny: false, nearNM: null};
+  for (let m = 0; m <= end; m += 2) {
+    const pt = dpxTrackAt(track, m), t = new Date(etd.getTime() + (m + off) * 60000);
+    const valid = t >= s.from && t <= s.to, ins = dpxPip(pt, s.polygon);
+    const d = ins ? 0 : dpxDistToPolyNM(pt, s.polygon);
+    if (ins && !r.insideAny) { r.insideAny = true; r.anyAt = t; r.anyNear = pt.near; }
+    if (!valid) continue;
+    if (ins) { if (!r.inside) { r.inside = true; r.from = t; r.fromNear = pt.near; } r.to = t; }
+    if (r.nearNM === null || d < r.nearNM) { r.nearNM = d; r.nearAt = t; r.nearWp = pt.near; }
+  }
+  return r;
 }
 
 // Weather folder: METAR/TAF lines "METAR FAOR 011600Z ... =" with wrapped continuation lines.
@@ -2810,9 +2885,19 @@ function dpxBuildPack(plan, folder, opts) {
                                   : 'Valid from ' + dpxFmtZ(s.from) + ', after you leave the FIR.';
       }
     }
+    let geo = null;
+    if (plan.track && s.polygon) {
+      geo = dpxSigmetGeometry(plan.track, plan.etd, s);
+      const hazardous = /TS|TURB|ICE|VA|TC|MTW|DS|SS|RDOACT/.test(s.phenomenon || '');
+      if (geo.inside) { sev = hazardous ? 'bad' : 'warn'; verdict = 'Your planned track is inside this area from ' + dpxFmtZ(geo.from) + ' (near ' + geo.fromNear + ') to ' + dpxFmtZ(geo.to) + ' while the SIGMET is valid. Plan to avoid it or get a fresh SIGMET.'; }
+      else if (geo.nearNM !== null && geo.nearNM <= 30) { sev = 'warn'; verdict = 'Your track passes ' + Math.round(geo.nearNM) + ' NM from this area near ' + geo.nearWp + ' at ' + dpxFmtZ(geo.nearAt) + ' while it is valid. Weather moves - keep clear.'; }
+      else if (geo.insideAny && geo.anyAt >= s.to && geo.anyAt - s.to <= 90 * 60000) { sev = 'warn'; verdict = 'This SIGMET expires at ' + dpxFmtZ(s.to) + ', ' + Math.round((geo.anyAt - s.to) / 60000) + ' min before your track reaches the area (near ' + geo.anyNear + ' at ' + dpxFmtZ(geo.anyAt) + '). Areas like this are often renewed - check for a replacement before departure and en route.'; }
+      else if (geo.insideAny) { sev = 'info'; verdict = 'Your track crosses this area near ' + geo.anyNear + ' at ' + dpxFmtZ(geo.anyAt) + ', but the SIGMET is not valid then (valid ' + dpxFmtZ(s.from) + '-' + dpxFmtZ(s.to) + '). Check for a replacement.'; }
+      else { sev = 'info'; verdict = 'Your planned track stays clear of this area while it is valid' + (geo.nearNM !== null ? ' (closest ' + Math.round(geo.nearNM) + ' NM).' : ' (you are not in the air during its validity).'); }
+    }
     if (sev !== 'info') F(sev, 'SIGMET', s.fir + ' SIGMET ' + s.id + ' (' + (s.phenomenon || 'see text') + (s.top ? ' top ' + s.top : '') + (s.status ? ', ' + s.status : '') + '): ' + verdict);
     else if (crossings.length) F('info', 'SIGMET', s.fir + ' SIGMET ' + s.id + ': ' + verdict);
-    return {...s, verdict, sev};
+    return {...s, verdict, sev, geo};
   });
 
   // --- NOTAMs
@@ -2863,7 +2948,8 @@ const DPX_LS = 'salogbook_dpx_last';
 
 function dpxState() {
   if (!state.dpx) {
-    state.dpx = {loading: false, error: '', notes: [], pack: null, plan: null, folder: null, savedAt: null, showAllNotams: false};
+    state.dpx = {loading: false, error: '', notes: [], pack: null, plan: null, folder: null, savedAt: null, showAllNotams: false, charts: {plan: [], folder: []}, chartsBusy: false, chartView: null};
+    dpxIdbGet('charts').then(v => { if (v && state.dpx) { state.dpx.charts = {plan: v.plan || [], folder: v.folder || []}; render(); } }).catch(() => {});
     try {
       const s = JSON.parse(localStorage.getItem(DPX_LS) || 'null');
       if (s) { dpxApply(state.dpx, s.planPages, s.folderPages); state.dpx.savedAt = s.savedAt; }
@@ -2891,9 +2977,15 @@ async function dpxLoadFiles(fileList) {
     let planPages = d.planPages, folderPages = d.folderPages;
     for (const f of files) {
       if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') { d.notes.push(f.name + ': not a PDF - skipped.'); continue; }
-      const data = new Uint8Array(await f.arrayBuffer());
+      const data = new Uint8Array(await f.arrayBuffer()), copy = data.slice();
       const pages = await dpxExtractPages(window.pdfjsLib, data);
       const kind = dpxClassify(pages);
+      if (kind === 'plan' || kind === 'weather') {
+        const k = kind === 'plan' ? 'plan' : 'folder';
+        d.chartsBusy = true; render();
+        try { d.charts[k] = await dpxRenderCharts(window.pdfjsLib, copy, dpxChartPages(pages, k)); } catch (e) { d.charts[k] = []; }
+        d.chartsBusy = false;
+      }
       const slim = pages.map(p => ({n: p.n, lines: p.lines}));
       if (kind === 'plan') { planPages = slim; d.notes.push(f.name + ': read as the flight plan (' + pages.length + ' pages).'); }
       else if (kind === 'weather') { folderPages = slim; d.notes.push(f.name + ': read as the weather folder (' + pages.length + ' pages).'); }
@@ -2901,6 +2993,7 @@ async function dpxLoadFiles(fileList) {
     }
     if (!planPages) { d.error = 'No flight plan found. Add the flight plan PDF (it starts with the route, e.g. "FZAA - FAOR") - the weather folder alone is not enough.'; }
     dpxApply(d, planPages, folderPages);
+    try { await dpxIdbPut('charts', d.charts); } catch (e) { /* charts still show this session */ }
     if (d.pack) {
       d.savedAt = Date.now();
       try { localStorage.setItem(DPX_LS, JSON.stringify({planPages, folderPages, savedAt: d.savedAt})); } catch (e) { /* storage full - pack still works this session */ }
@@ -2913,6 +3006,7 @@ async function dpxLoadFiles(fileList) {
 
 function dpxClear() {
   try { localStorage.removeItem(DPX_LS); } catch (e) {}
+  dpxIdbDel('charts').catch(() => {});
   state.dpx = null; render();
 }
 
@@ -3025,6 +3119,110 @@ function dpxPreDepartureCard(pack) {
   return card;
 }
 
+// ---- Chart pages: rendered to images at import time and kept in IndexedDB so they work offline ----
+function dpxIdb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('salogbook_dpx', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function dpxIdbOp(mode, fn) {
+  const db = await dpxIdb();
+  return new Promise((res, rej) => { const tx = db.transaction('kv', mode), rq = fn(tx.objectStore('kv')); tx.oncomplete = () => res(rq && rq.result); tx.onerror = () => rej(tx.error); });
+}
+const dpxIdbPut = (k, v) => dpxIdbOp('readwrite', st => st.put(v, k));
+const dpxIdbGet = k => dpxIdbOp('readonly', st => st.get(k));
+const dpxIdbDel = k => dpxIdbOp('readwrite', st => st.delete(k));
+
+// Which pages are charts, and what to call them. Text pages (METAR, NOTAM, navlog) are never charts.
+function dpxChartPages(pages, kind) {
+  const out = [];
+  pages.forEach(p => {
+    const t = p.text, first = p.lines.slice(0, 8).join(' ');
+    let label = null;
+    let m;
+    if ((m = t.match(/SIG\. WEATHER\s+(FL \d+ to \d+)[\s\S]*?VALID (\w{3} \d+ \d{4} \d{4}Z)/))) label = 'Significant weather ' + m[1] + ' - valid ' + m[2];
+    else if ((m = t.match(/Vertical Cross Section Chart/))) label = 'Vertical cross-section (wind / temperature / turbulence)';
+    else if (/ETP WIND CHART/.test(t)) label = 'ETP wind chart';
+    else if ((m = t.match(/(PGRE\d+ \w+ \d{6})/))) label = 'Wind / temperature chart ' + m[1];
+    else if (/ISSUED BY WAFC London/.test(t) && /CB|TURB|JET/i.test(t)) label = 'Significant weather chart (WAFC London)';
+    else if (kind === 'plan' && /^0°\s+4°|WIND\/TEM/.test(first)) label = 'Vertical cross-section (wind / temperature / turbulence)';
+    else if (kind === 'folder' && p.n >= 6 && p.lines.length > 60 && !/METAR|TAF /.test(t)) label = (/^[A-Z]{4}$/.test((p.lines[1] || '').trim()) ? 'Wind / temperature at ' + p.lines[1].trim() : 'Weather chart') + ' (folder page ' + p.n + ')';
+    else if (kind === 'folder' && /^FZAA|^[A-Z]{4}$/.test(p.lines[1] || '') && /\d+\s+\d+\s+\d+/.test(p.lines.slice(2, 5).join(' ')) && p.n >= 6) label = 'Wind / temperature at ' + (p.lines[1] || '').trim() + ' (folder page ' + p.n + ')';
+    if (label) out.push({n: p.n, label});
+  });
+  return out;
+}
+
+async function dpxRenderCharts(pdfjsLib, data, list) {
+  if (!list.length) return [];
+  const pdf = await pdfjsLib.getDocument({data}).promise, out = [];
+  for (const c of list) {
+    try {
+      const page = await pdf.getPage(c.n), vp = page.getViewport({scale: 2});
+      const cv = document.createElement('canvas'); cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+      await page.render({canvasContext: cv.getContext('2d'), viewport: vp}).promise;
+      out.push({n: c.n, label: c.label, img: cv.toDataURL('image/jpeg', 0.8), w: cv.width, h: cv.height});
+    } catch (e) { /* one bad page should not lose the rest */ }
+  }
+  return out;
+}
+
+// ---- Route + SIGMET map (plain SVG, no map tiles, works offline) ----
+function dpxMapSvg(pack) {
+  const p = pack.plan, tr = p.track; if (!tr) return null;
+  const sig = pack.sigmets.filter(s => s.polygon);
+  const lats = tr.map(x => x.lat).concat(...sig.flatMap(s => s.polygon.map(q => q.lat)));
+  const lons = tr.map(x => x.lon).concat(...sig.flatMap(s => s.polygon.map(q => q.lon)));
+  const minLa = Math.min(...lats) - 0.7, maxLa = Math.max(...lats) + 0.7, minLo = Math.min(...lons) - 0.7, maxLo = Math.max(...lons) + 0.7;
+  const k = Math.cos(((minLa + maxLa) / 2) * Math.PI / 180), W = 360, wDeg = (maxLo - minLo) * k, hDeg = maxLa - minLa, H = Math.round(W * hDeg / wDeg);
+  const X = lo => ((lo - minLo) / (maxLo - minLo)) * W, Y = la => ((maxLa - la) / (maxLa - minLa)) * H;
+  const ns = 'http://www.w3.org/2000/svg', mk = (n, a, txt) => { const e = document.createElementNS(ns, n); Object.keys(a || {}).forEach(q => e.setAttribute(q, a[q])); if (txt) e.textContent = txt; return e; };
+  const svg = mk('svg', {viewBox: '0 0 ' + W + ' ' + H, width: '100%', style: 'background:#F4F8FB;border:1px solid #DEE2E6;border-radius:8px;display:block'});
+  // graticule every 5 degrees
+  for (let la = Math.ceil(minLa / 5) * 5; la <= maxLa; la += 5) { svg.appendChild(mk('line', {x1: 0, x2: W, y1: Y(la), y2: Y(la), stroke: '#DDE5EC', 'stroke-width': 0.6})); svg.appendChild(mk('text', {x: 3, y: Y(la) - 2, 'font-size': 7, fill: '#8896A3'}, Math.abs(la) + (la < 0 ? 'S' : 'N'))); }
+  for (let lo = Math.ceil(minLo / 5) * 5; lo <= maxLo; lo += 5) { svg.appendChild(mk('line', {y1: 0, y2: H, x1: X(lo), x2: X(lo), stroke: '#DDE5EC', 'stroke-width': 0.6})); svg.appendChild(mk('text', {x: X(lo) + 2, y: H - 3, 'font-size': 7, fill: '#8896A3'}, Math.abs(lo) + (lo < 0 ? 'W' : 'E'))); }
+  const col = {bad: '#C62828', warn: '#E0A800', info: '#8896A3'};
+  sig.forEach(s => {
+    svg.appendChild(mk('polygon', {points: s.polygon.map(q => X(q.lon).toFixed(1) + ',' + Y(q.lat).toFixed(1)).join(' '), fill: col[s.sev] || col.info, 'fill-opacity': s.sev === 'info' ? 0.12 : 0.28, stroke: col[s.sev] || col.info, 'stroke-width': 1, 'stroke-dasharray': s.sev === 'info' ? '3,2' : ''}));
+    const c = s.polygon[0]; svg.appendChild(mk('text', {x: X(c.lon) + 2, y: Y(c.lat) - 2, 'font-size': 7.5, fill: col[s.sev] || col.info, 'font-weight': 700}, s.fir + ' ' + s.id));
+  });
+  svg.appendChild(mk('polyline', {points: tr.map(q => X(q.lon).toFixed(1) + ',' + Y(q.lat).toFixed(1)).join(' '), fill: 'none', stroke: '#0B3D91', 'stroke-width': 1.8}));
+  tr.forEach((q, i) => { if (i % 4 === 0 || i === tr.length - 1) { svg.appendChild(mk('circle', {cx: X(q.lon), cy: Y(q.lat), r: 2, fill: '#0B3D91'})); svg.appendChild(mk('text', {x: X(q.lon) + 3, y: Y(q.lat) + 8, 'font-size': 7, fill: '#0B3D91'}, q.name + ' ' + dpxFmtZ(q.t).slice(0, 4))); } });
+  return svg;
+}
+
+function dpxChartOverlay(d) {
+  const v = d.chartView; if (!v) return null;
+  const c = (d.charts[v.kind] || [])[v.i]; if (!c) return null;
+  const all = d.charts.plan.concat(d.charts.folder).filter(Boolean);
+  const wrap = div({style: {position: 'fixed', inset: '0', background: 'rgba(0,0,0,.88)', zIndex: '9999', display: 'flex', flexDirection: 'column'}});
+  const bar = div({style: {display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 12px', color: '#fff'}},
+    div({style: {flex: 1, fontSize: '12px', fontWeight: '700'}}, c.label),
+    btn({style: {width: 'auto', background: '#fff', color: '#222', border: 'none', borderRadius: '6px', padding: '6px 12px', fontSize: '12px'}, onclick: () => { d.chartView = Object.assign({}, v, {zoom: v.zoom === 1 ? 2 : v.zoom === 2 ? 3 : 1}); render(); }}, v.zoom === 1 ? 'Zoom 2x' : v.zoom === 2 ? 'Zoom 3x' : 'Fit'),
+    btn({style: {width: 'auto', background: '#FFB612', color: '#222', border: 'none', borderRadius: '6px', padding: '6px 12px', fontSize: '12px', fontWeight: '700'}, onclick: () => { d.chartView = null; render(); }}, 'Close'));
+  const scroller = div({style: {flex: 1, overflow: 'auto', WebkitOverflowScrolling: 'touch', background: '#fff'}});
+  const img = el('img', {src: c.img, style: {width: (v.zoom * 100) + '%', maxWidth: 'none', display: 'block'}});
+  scroller.appendChild(img);
+  wrap.appendChild(bar); wrap.appendChild(scroller);
+  return wrap;
+}
+
+function dpxChartsSection(d, main) {
+  const sets = [['plan', 'Flight plan'], ['folder', 'Weather folder']].filter(x => (d.charts[x[0]] || []).length);
+  main.appendChild(el('h3', {style: {margin: '14px 0 4px', fontSize: '15px'}}, 'Charts'));
+  main.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '8px'}}, 'Chart pages from your PDFs, saved on this device. The app does not interpret them - read them against your track and the flags above.'));
+  if (!sets.length) { main.appendChild(div({style: {fontSize: '12px', color: '#555', marginBottom: '14px'}}, d.chartsBusy ? 'Preparing charts...' : 'No chart pages were found in these PDFs.')); return; }
+  sets.forEach(([kind, title]) => {
+    main.appendChild(div({style: {fontSize: '12px', fontWeight: '700', margin: '6px 0 4px'}}, title + ' (' + d.charts[kind].length + ')'));
+    const row = div({style: {display: 'flex', gap: '8px', overflowX: 'auto', paddingBottom: '8px', marginBottom: '6px'}});
+    d.charts[kind].forEach((c, i) => row.appendChild(el('button', {style: {flex: '0 0 150px', background: '#fff', border: '1px solid #CED4DA', borderRadius: '8px', padding: '4px', cursor: 'pointer', textAlign: 'left'}, onclick: () => { d.chartView = {kind, i, zoom: 1}; render(); }},
+      el('img', {src: c.img, style: {width: '100%', borderRadius: '4px', display: 'block'}}), div({style: {fontSize: '10px', color: '#333', marginTop: '3px', lineHeight: '1.3'}}, c.label))));
+    main.appendChild(row);
+  });
+}
+
 function dpxRender(main) {
   const d = dpxState();
   main.appendChild(div({style: {marginBottom: '12px'}},
@@ -3092,6 +3290,8 @@ function dpxRender(main) {
 
   // SIGMETs
   main.appendChild(el('h3', {style: {margin: '14px 0 8px', fontSize: '15px'}}, 'SIGMETs'));
+  const mapSvg = dpxMapSvg(pack);
+  if (mapSvg) { main.appendChild(div({style: {marginBottom: '10px'}}, mapSvg, div({style: {fontSize: '10px', color: '#888', marginTop: '3px'}}, 'Planned track (blue, times are ETA at each point) and SIGMET areas: red = on your track, amber = close, grey = clear or not valid at your time. Schematic only - not for navigation.'))); }
   if (!pack.sigmets.length) main.appendChild(div({style: {fontSize: '12px', color: '#555', marginBottom: '14px'}}, 'No SIGMETs in the pack' + (p.noSigmetFirs.length ? ' (none found for ' + p.noSigmetFirs.join(', ') + ')' : '') + '.'));
   pack.sigmets.forEach(s => {
     main.appendChild(dpxCard(s.sev === 'info' ? 'ok' : s.sev, [
@@ -3103,6 +3303,8 @@ function dpxRender(main) {
     ]));
   });
   if (p.noSigmetFirs.length && pack.sigmets.length) main.appendChild(div({style: {fontSize: '11px', color: '#666', margin: '-8px 0 14px'}}, 'No SIGMET/AIRMET found for ' + p.noSigmetFirs.join(', ') + '.'));
+
+  dpxChartsSection(d, main);
 
   // NOTAMs
   main.appendChild(el('h3', {style: {margin: '14px 0 8px', fontSize: '15px'}}, 'NOTAMs (' + pack.notams.length + ')'));
@@ -3135,6 +3337,7 @@ function dpxRender(main) {
 
   main.appendChild(btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '8px', padding: '11px 20px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', marginTop: '6px'}, onclick: dpxLogThisFlight}, 'Log this flight'));
   main.appendChild(div({style: {fontSize: '10px', color: '#999', marginTop: '6px'}}, 'Pre-fills the date, airports, route, type and flight number from the documents. Times and hours are left for you to enter after the flight.'));
+  const ov = dpxChartOverlay(d); if (ov) main.appendChild(ov);
 }
 
 
