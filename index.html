@@ -2953,6 +2953,78 @@ function dpxNotamRow(n) {
   return row;
 }
 
+// ---- Pre-departure summary: your currency AT the planned ETD + this pack's flags + your own confirmations ----
+const DPX_CONFIRMS = [
+  ['fit', 'I am fit to fly (illness, medication, stress, alcohol, fatigue, eating)'],
+  ['docs', 'Licence, medical and ratings are valid for this flight'],
+  ['wx', 'I have fresh weather (departure METAR within the hour before ETD)'],
+  ['notam', 'I have read the NOTAMs, not just the flagged ones'],
+  ['fuel', 'Fuel, weight and balance and performance are confirmed'],
+];
+function dpxChecksKey(p) { return 'salogbook_dpx_checks_' + p.dep + p.arr + (p.etd ? p.etd.toISOString().slice(0, 13) : ''); }
+function dpxLoadChecks(p) { try { return JSON.parse(localStorage.getItem(dpxChecksKey(p)) || '{}'); } catch (e) { return {}; } }
+function dpxSetCheck(p, k, v) { const c = dpxLoadChecks(p); c[k] = v; try { localStorage.setItem(dpxChecksKey(p), JSON.stringify(c)); } catch (e) {} render(); }
+
+function dpxPreDeparture(pack) {
+  const p = pack.plan, rows = [];
+  const at = p.etd && p.etd > new Date() ? p.etd : new Date();
+  const when = p.etd && p.etd > new Date() ? ' at ETD' : '';
+  // 1. your currency on the day
+  let items = [];
+  try { items = curEvaluate(curActiveRuleIds(curPrefs()), state.flights, state.endorsements, state.profile, at); } catch (e) { /* no profile yet */ }
+  if (!items.length) rows.push({sev: 'info', area: 'Currency', text: 'No requirements selected - choose a profile on the Recency tab to include your currency here.'});
+  else {
+    const bad = items.filter(i => i.status === 'bad'), warn = items.filter(i => i.status === 'warn'), none = items.filter(i => i.status === 'none');
+    bad.forEach(i => rows.push({sev: 'bad', area: 'Currency', text: i.label + ' not current' + when + ' (' + i.detail + ')'}));
+    warn.forEach(i => rows.push({sev: 'warn', area: 'Currency', text: i.label + ' expiring' + (i.daysLeft != null ? ' in ' + i.daysLeft + ' days' : '') + ' (' + i.detail + ')'}));
+    if (none.length) rows.push({sev: 'info', area: 'Currency', text: none.length + ' requirement' + (none.length > 1 ? 's' : '') + ' with nothing recorded: ' + none.map(i => i.label).join(', ')});
+    if (!bad.length && !warn.length) rows.push({sev: 'ok', area: 'Currency', text: 'All tracked requirements are current' + when + '.'});
+  }
+  // 2. this aircraft type
+  if (p.acType) {
+    const code = p.acType.split(' ')[0], pt = curPerType(state.flights, at).find(t => t.type === code || t.type.startsWith(code) || code.startsWith(t.type));
+    if (!pt) rows.push({sev: 'warn', area: code, text: 'No logged flights on ' + code + ' in the last 12 months. Check your type recency and any simulator/check requirements.'});
+    else if (pt.day < 3) rows.push({sev: 'warn', area: code, text: 'Only ' + pt.day + ' take-off/landing' + (pt.day === 1 ? '' : 's') + ' logged on ' + code + ' in the last 90 days (3 needed for passenger-carrying day currency; verify against your operator\'s rules). Last flown ' + fmtDate(pt.last) + '.'});
+    else rows.push({sev: 'ok', area: code, text: pt.day + ' day take-offs/landings in the last 90 days on ' + code + (pt.night ? ', ' + pt.night + ' night' : ', none at night') + '. Last flown ' + fmtDate(pt.last) + '.'});
+  }
+  // 3. this pack
+  const nb = pack.findings.filter(f => f.sev === 'bad'), nw = pack.findings.filter(f => f.sev === 'warn');
+  if (nb.length) rows.push({sev: 'bad', area: 'Pack', text: nb.length + ' problem' + (nb.length > 1 ? 's' : '') + ' in the dispatch pack - see "What needs your attention" below.'});
+  if (nw.length) rows.push({sev: 'warn', area: 'Pack', text: nw.length + ' caution' + (nw.length > 1 ? 's' : '') + ' in the dispatch pack (weather, SIGMET, NOTAM).'});
+  if (!nb.length && !nw.length) rows.push({sev: 'ok', area: 'Pack', text: 'Nothing flagged in the dispatch pack.'});
+  if (pack.plan.warnings && pack.plan.warnings.length) rows.push({sev: 'warn', area: 'Pack', text: 'Part of the flight plan could not be read (' + pack.plan.warnings.join('; ') + ') - that part is unchecked.'});
+  // 4. staleness
+  if (p.created) {
+    const h = (new Date() - p.created) / 3600000;
+    if (h > 6) rows.push({sev: 'warn', area: 'Pack', text: 'This flight plan was created ' + Math.round(h) + ' h ago. Weather and NOTAMs will have moved on - get a fresh pack close to departure.'});
+  }
+  const rank = {bad: 0, warn: 1, info: 2, ok: 3};
+  rows.sort((a, b) => rank[a.sev] - rank[b.sev]);
+  return rows;
+}
+
+function dpxPreDepartureCard(pack) {
+  const rows = dpxPreDeparture(pack), p = pack.plan, checks = dpxLoadChecks(p);
+  const worst = rows.some(r => r.sev === 'bad') ? 'bad' : rows.some(r => r.sev === 'warn') ? 'warn' : 'ok';
+  const done = DPX_CONFIRMS.filter(c => checks[c[0]]).length, c = BRF_COL[worst];
+  const card = div({style: {background: '#fff', border: '1px solid #DEE2E6', borderLeft: '6px solid ' + c.fg, borderRadius: '10px', padding: '14px 18px', marginBottom: '14px'}});
+  card.appendChild(div({style: {fontWeight: '800', fontSize: '15px', marginBottom: '2px'}}, 'Pre-departure summary'));
+  card.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '10px'}}, 'Your currency on the day, this aircraft type, and the pack - in one place. It is a prompt, not a go/no-go decision: that stays with you.'));
+  rows.forEach(r => {
+    const col = r.sev === 'ok' ? BRF_COL.ok : r.sev === 'info' ? {bg: '#F8F9FA', fg: '#555', bd: '#E9ECEF'} : BRF_COL[r.sev];
+    card.appendChild(div({style: {background: col.bg, border: '1px solid ' + col.bd, color: col.fg, borderRadius: '6px', padding: '6px 10px', fontSize: '12px', marginBottom: '5px', lineHeight: '1.5'}},
+      el('b', {style: {fontFamily: 'monospace', marginRight: '6px'}}, r.area), r.text));
+  });
+  card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, 'Your confirmations (' + done + ' of ' + DPX_CONFIRMS.length + ')'));
+  DPX_CONFIRMS.forEach(([k, label]) => {
+    const cb = el('input', {type: 'checkbox', style: {width: '18px', height: '18px', marginRight: '8px', flexShrink: 0}});
+    cb.checked = !!checks[k];
+    cb.addEventListener('change', () => dpxSetCheck(p, k, cb.checked));
+    card.appendChild(el('label', {style: {display: 'flex', alignItems: 'center', fontSize: '12px', padding: '6px 0', borderBottom: '1px solid #F1F3F5', cursor: 'pointer'}}, cb, label));
+  });
+  return card;
+}
+
 function dpxRender(main) {
   const d = dpxState();
   main.appendChild(div({style: {marginBottom: '12px'}},
@@ -2982,6 +3054,8 @@ function dpxRender(main) {
     div({style: {fontFamily: 'monospace', fontSize: '13px', marginTop: '6px'}}, p.dep + ' → ' + p.arr + '  ' + (p.etd ? p.etd.toISOString().slice(0, 10) : '') + '  ETD ' + fz(p.etd) + '  ETA ' + fz(p.eta) + (p.eteMin ? '  (' + Math.floor(p.eteMin / 60) + 'h' + String(p.eteMin % 60).padStart(2, '0') + ', ' + (p.distNM || '?') + ' NM)' : '')),
     div({style: {fontSize: '11px', color: '#555', marginTop: '4px'}}, [p.callsign, p.acType, p.rules, p.cruiseFL ? 'FL' + p.cruiseFL : null, p.alternate ? 'alternate ' + p.alternate : null].filter(Boolean).join(' - ')),
     div({style: {fontSize: '11px', color: '#555', marginTop: '4px'}}, 'Checks are fixed rules on the documents\' own text. They help you spot issues - they do not replace reading the pack, and they are not a go/no-go decision.')));
+
+  main.appendChild(dpxPreDepartureCard(pack));
 
   // parser warnings
   const pw = [...(p.warnings || []), ...((pack.folder && pack.folder.warnings) || [])];
