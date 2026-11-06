@@ -1879,6 +1879,7 @@ function render() {
     const nightPIC = state.flights.filter(f=>(f.night||0)>0&&(f.pic||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.pic||0),0);
     const nightLdgs = totals.night_ldgs||0;
     const nightDual = state.flights.filter(f=>(f.night||0)>0&&(f.dual||0)>0).reduce((a,f)=>a+Math.min(f.night||0,f.dual||0),0);
+    const cplFlightTime = totals.flight + Math.min(totals.sim, 20); // CA 61-05a: up to 20h FSTD time credits toward the 200h CPL total
 
     function req(label, reg, current, reqVal, note, color='var(--sky)', unit='h') {
       const done = current >= reqVal;
@@ -1942,7 +1943,7 @@ function render() {
     ],'Valid PPL + Night Rating + 50h XC PIC + IR theory + Operational Procedures exam',['IR Operational Procedures','IR theory examination']));
 
     main.appendChild(licenceBlock('Commercial Pilot Licence (CPL)','Aeroplane - SACAA CAR 61.05','CAR 61.05 / SA-CATS 61 App 2.0A','var(--amber)',[
-      req('Total Flight Time','CAR 61.05.1(1)(b)',totals.flight,200,'Minimum 200 hours total flight time','var(--amber)'),
+      req('Total Flight Time','CAR 61.05.1(1)(b)',cplFlightTime,200,'Minimum 200 hours total flight time (may include up to 20 hours FSTD time)','var(--amber)'),
       req('Pilot-in-Command (PIC)','CAR 61.05.1(1)(b)(i)',totals.pic,100,'At least 100 hours as Pilot-in-Command','var(--amber)'),
       req('Cross-Country as PIC','CAR 61.05.1(1)(b)(ii)',xcPIC,20,'At least 20 hours XC as PIC including one flight of at least 300 NM with landings at 3 points','var(--teal)'),
       req('Instrument Flight Time','CAR 61.05.1(1)(b)(iii)',totalInst,40,'At least 40 hours instrument training (max 20 hours on approved simulator)','var(--purple)'),
