@@ -2032,22 +2032,31 @@ function brfResolve(day, hour, min, now) {
   return new Date(Date.UTC(y, mo, day, hour, min || 0));   // hour 24 rolls to next day automatically
 }
 
+// Reports copied from PDFs/messages: strip the trailing '=', collapse whitespace and
+// re-join an intensity sign that a line wrap separated from its weather code ("- TSRA").
+function brfNormalise(raw) {
+  return String(raw || '').replace(/=+\s*$/, '').replace(/\s+/g, ' ').replace(/([+-]) (?=[A-Z]{2})/g, '$1').trim();
+}
+// Status words that can follow the station: COR/AUTO/NIL/RTD, delayed RRx, corrected CCx, amended AAx, AMD.
+const BRF_STATUS_RE = /^(COR|AUTO|NIL|RTD|AMD|(RR|CC|AA)[A-Z])$/;
+
 // ---- METAR ------------------------------------------------------------------
 function brfParseMetar(raw, now) {
   if (!raw) return null;
   now = now || new Date();
-  const out = {raw: raw.trim(), station:null, time:null, obsTime:null, temp:null, dew:null, qnh_hpa:null, trends:[], ...brfNewSnap()};
+  const out = {raw: brfNormalise(raw), station:null, time:null, obsTime:null, temp:null, dew:null, qnh_hpa:null, trends:[], missingData:false, ...brfNewSnap()};
   const body = out.raw.split(/\bRMK\b/)[0].trim();
+  out.missingData = /(^| )\/{2,}/.test(body);
   const toks = body.split(/\s+/);
   let i = 0;
   if (toks[i] === 'METAR' || toks[i] === 'SPECI') i++;
   if (/^[A-Z]{4}$/.test(toks[i])) out.station = toks[i++];
-  if (toks[i] === 'COR' || toks[i] === 'AUTO') i++;
+  while (BRF_STATUS_RE.test(toks[i] || '')) i++;
   const t = brfParseTime(toks[i]); if (t) { out.time = t; out.obsTime = brfResolve(t.day, t.hour, t.min, now); i++; }
   let prev = '', trend = null;
   for (; i < toks.length; i++) {
     const tok = toks[i];
-    if (tok === 'AUTO' || tok === 'COR') { prev = tok; continue; }
+    if (BRF_STATUS_RE.test(tok) || /^\/+$/.test(tok) || /^\/{2,}(\/|CB|TCU)*$/.test(tok)) { prev = tok; continue; }
     if (tok === 'NOSIG') { trend = null; prev = tok; continue; }
     if (tok === 'BECMG' || tok === 'TEMPO') { trend = {kind: tok, ...brfNewSnap()}; out.trends.push(trend); prev = tok; continue; }
     if (/^(FM|TL|AT)\d{4}$/.test(tok)) { prev = tok; continue; }
@@ -2069,12 +2078,13 @@ function brfParseMetar(raw, now) {
 function brfParseTaf(raw, now) {
   if (!raw || /\bNIL\b/.test(raw)) return null;
   now = now || new Date();
-  const out = {raw: raw.trim(), station:null, issued:null, from:null, to:null, periods:[]};
+  const out = {raw: brfNormalise(raw), station:null, issued:null, from:null, to:null, periods:[]};
   const toks = out.raw.split(/\s+/);
   let i = 0;
   if (toks[i] === 'TAF') i++;
-  if (toks[i] === 'AMD' || toks[i] === 'COR') i++;
+  while (BRF_STATUS_RE.test(toks[i] || '')) i++;
   if (/^[A-Z]{4}$/.test(toks[i])) out.station = toks[i++];
+  while (BRF_STATUS_RE.test(toks[i] || '')) i++;    // SAWS puts AAA/CCA/AMD after the station
   const it = brfParseTime(toks[i]); if (it) { out.issued = brfResolve(it.day, it.hour, it.min, now); i++; }
   let m = (toks[i] || '').match(/^(\d{2})(\d{2})\/(\d{2})(\d{2})$/);
   if (m) { out.from = brfResolve(+m[1], +m[2], 0, now); out.to = brfResolve(+m[3], +m[4], 0, now); i++; }
@@ -2163,8 +2173,11 @@ function brfAnalyse(data, opts) {
   const flags = [];
   if (!metar) flags.push({sev:'warn', text:'No METAR available - this aerodrome may not report weather. Use the nearest reporting aerodrome or the SA Weather Service.', when:'now'});
   else {
-    const ageMin = Math.round((now - metar.obsTime) / 60000);
-    if (ageMin > 90) flags.push({sev:'warn', text:'METAR is ' + ageMin + ' minutes old - may no longer be representative', when:'now'});
+    if (metar.obsTime) {
+      const ageMin = Math.round((now - metar.obsTime) / 60000);
+      if (ageMin > 90) flags.push({sev:'warn', text:'METAR is ' + ageMin + ' minutes old - may no longer be representative', when:'now'});
+    } else flags.push({sev:'info', text:'METAR time could not be read - check how old it is', when:'now'});
+    if (metar.missingData) flags.push({sev:'info', text:'Automatic station: some elements (visibility, weather or cloud) are not reported', when:'now'});
     flags.push(...brfSnapFlags({...metar}, rules, 'now', {fogRisk:true}));
     const da = brfDensityAlt(data.elevM, metar.temp, metar.qnh_hpa);
     if (da) {
@@ -2207,7 +2220,6 @@ function brfMetarLine(m) {
          ' - ' + brfFmtClouds(m) + (m.temp != null ? ' - ' + m.temp + '/' + (m.dew != null ? m.dew : '?') + '°C' : '') +
          (m.qnh_hpa ? ' - QNH ' + m.qnh_hpa : '');
 }
-
 
 // ─── BRIEFING UI ─────────────────────────────────────────────────────────────
 const BRF_COL = {
