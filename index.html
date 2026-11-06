@@ -1903,7 +1903,7 @@ function render() {
     function licenceBlock(title, sub, reg, color, items, prereqs, exams) {
       const card = div({style:{background:'var(--card)',border:`2px solid ${color}55`,borderRadius:'11px',padding:'16px 18px',marginBottom:'18px'}});
       const head = div({style:{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:'8px',flexWrap:'wrap',gap:'8px'}});
-      head.appendChild(div({},div({style:{fontWeight:'800',fontSize:'16px',color}},'title'),div({style:{fontSize:'11px',color:'var(--steel)',marginTop:'2px'}},'sub')));
+      head.appendChild(div({},div({style:{fontWeight:'800',fontSize:'16px',color}},title),div({style:{fontSize:'11px',color:'var(--steel)',marginTop:'2px'}},sub)));
       head.appendChild(span({class:'badge',style:{background:'var(--bg)',border:'1px solid var(--border)',color:'var(--muted)',fontSize:'9px',fontFamily:'monospace',padding:'3px 8px'}},reg));
       card.appendChild(head);
       if(prereqs) card.appendChild(div({style:{background:color+'11',border:`1px solid ${color}33`,borderRadius:'6px',padding:'7px 11px',marginBottom:'12px',fontSize:'11px',color,lineHeight:'1.6'}},'Prerequisites: '+prereqs));
@@ -1929,25 +1929,25 @@ function render() {
       req('Cross-Country as PIC','CAR 61.04.1(1)(b)(iii)',xcPIC,5,'At least 5 hours XC as PIC including one solo XC of 150 NM with 2 full-stop landings','var(--teal)'),
     ],'SPL + Class 2 Medical + Min age 17',PPL_EXAMS));
 
-    main.appendChild(licenceBlock('Night Rating','Aeroplane - SACAA CAR 61.14','CAR 61.14 / SA-CATS 61.10.1','#60A5FA',[
-      req('Instrument Instruction','CAR 61.14.1(1)(b)(i)',totalInst,10,'At least 10 hours instrument instruction (max 5 hours on approved FSTD)','var(--purple)'),
-      req('Night Flying Total','CAR 61.14.1(1)(b)(ii)',totals.night,5,'At least 5 hours total night flight time','#60A5FA'),
-      req('Night Dual Instruction','CAR 61.14.1(1)(b)(ii)',nightDual,3,'At least 3 hours dual instruction at night','#60A5FA'),
-      req('Night Full-Stop Landings','CAR 61.14.1(1)(b)(iii)',nightLdgs,5,'At least 5 full-stop night landings under dual instruction','#60A5FA',''),
+    main.appendChild(licenceBlock('Night Rating','Aeroplane - SACAA CAR 61.10','CAR 61.10 / SA-CATS 61.10.1','#60A5FA',[
+      req('Instrument Instruction','CAR 61.10.1(1)(b)(i)',totalInst,10,'At least 10 hours instrument instruction (max 5 hours on approved FSTD)','var(--purple)'),
+      req('Night Flying Total','CAR 61.10.1(1)(b)(ii)',totals.night,5,'At least 5 hours total night flight time','#60A5FA'),
+      req('Night Dual Instruction','CAR 61.10.1(1)(b)(ii)',nightDual,3,'At least 3 hours dual instruction at night','#60A5FA'),
+      req('Night Full-Stop Landings','CAR 61.10.1(1)(b)(iii)',nightLdgs,5,'At least 5 full-stop night landings under dual instruction','#60A5FA',''),
     ],'Valid PPL + Class 2 Medical + Night Rating theory exam',['Night Rating theory (PPL-based online SACAA exam)']));
 
-    main.appendChild(licenceBlock('Instrument Rating (IR)','Aeroplane - SACAA CAR 61.05','CAR 61.05 / SA-CATS 61','var(--purple)',[
-      req('Total Instrument Time','CAR 61.05.1(1)(b)',totalInst,40,'Minimum 40 hours instrument flight training. Night Rating hours credit toward this total. Max 20 hours on simulator.','var(--purple)'),
-      req('Cross-Country as PIC','CAR 61.05.1(1)(a)(iii)',xcPIC,50,'At least 50 hours XC as PIC before IR (10 hours must be in the aircraft category sought)','var(--teal)'),
+    main.appendChild(licenceBlock('Instrument Rating (IR)','Aeroplane - SACAA CAR 61.11','CAR 61.11 / SA-CATS 61','var(--purple)',[
+      req('Total Instrument Time','CAR 61.11.1(1)(b)',totalInst,40,'Minimum 40 hours instrument flight training. Night Rating hours credit toward this total. Max 20 hours on simulator.','var(--purple)'),
+      req('Cross-Country as PIC','CAR 61.11.1(1)(a)(iii)',xcPIC,50,'At least 50 hours XC as PIC before IR (10 hours must be in the aircraft category sought)','var(--teal)'),
     ],'Valid PPL + Night Rating + 50h XC PIC + IR theory + Operational Procedures exam',['IR Operational Procedures','IR theory examination']));
 
-    main.appendChild(licenceBlock('Commercial Pilot Licence (CPL)','Aeroplane - SACAA CAR 61.07','CAR 61.07 / SA-CATS 61 App 2.0A','var(--amber)',[
-      req('Total Flight Time','CAR 61.07.1(1)(b)',totals.flight,200,'Minimum 200 hours total flight time','var(--amber)'),
-      req('Pilot-in-Command (PIC)','CAR 61.07.1(1)(b)(i)',totals.pic,100,'At least 100 hours as Pilot-in-Command','var(--amber)'),
-      req('Cross-Country as PIC','CAR 61.07.1(1)(b)(ii)',xcPIC,20,'At least 20 hours XC as PIC including one flight of at least 300 NM with landings at 3 points','var(--teal)'),
-      req('Instrument Flight Time','CAR 61.07.1(1)(b)(iii)',totalInst,40,'At least 40 hours instrument training (max 20 hours on approved simulator)','var(--purple)'),
-      req('Night Flying as PIC','CAR 61.07.1(1)(b)(iv)',nightPIC,5,'At least 5 hours night as PIC','#60A5FA'),
-      req('Night Landings','CAR 61.07.1(1)(b)(v)',nightLdgs,10,'At least 10 full-stop night landings','#60A5FA',''),
+    main.appendChild(licenceBlock('Commercial Pilot Licence (CPL)','Aeroplane - SACAA CAR 61.05','CAR 61.05 / SA-CATS 61 App 2.0A','var(--amber)',[
+      req('Total Flight Time','CAR 61.05.1(1)(b)',totals.flight,200,'Minimum 200 hours total flight time','var(--amber)'),
+      req('Pilot-in-Command (PIC)','CAR 61.05.1(1)(b)(i)',totals.pic,100,'At least 100 hours as Pilot-in-Command','var(--amber)'),
+      req('Cross-Country as PIC','CAR 61.05.1(1)(b)(ii)',xcPIC,20,'At least 20 hours XC as PIC including one flight of at least 300 NM with landings at 3 points','var(--teal)'),
+      req('Instrument Flight Time','CAR 61.05.1(1)(b)(iii)',totalInst,40,'At least 40 hours instrument training (max 20 hours on approved simulator)','var(--purple)'),
+      req('Night Flying as PIC','CAR 61.05.1(1)(b)(iv)',nightPIC,5,'At least 5 hours night as PIC','#60A5FA'),
+      req('Night Landings','CAR 61.05.1(1)(b)(v)',nightLdgs,10,'At least 10 full-stop night landings','#60A5FA',''),
     ],'Valid PPL + Night Rating + Class 1 Medical + Min age 18',CPL_EXAMS));
   }
 
