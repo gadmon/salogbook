@@ -1,5 +1,5 @@
 // SALOGBOOK Service Worker v4
-const CACHE_NAME = 'salogbook-v4';
+const CACHE_NAME = 'salogbook-v5';
 
 // External libraries the app has a hard dependency on just to boot (Supabase JS
 // creates the client at the top of index.html's script - if it fails to load,
@@ -8,6 +8,8 @@ const CACHE_NAME = 'salogbook-v4';
 const PRECACHE_URLS = [
   '/salogbook/index.html',
   'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js',
+  'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js',
+  'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js',
 ];
 
 // Install - cache the app shell and its critical external dependencies

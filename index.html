@@ -2190,8 +2190,11 @@ function brfAnalyse(data, opts) {
   else {
     taf.periods.forEach(p => {
       const end = p.to || taf.to, start = p.from || taf.from;
-      if (end && end < now) return;
-      if (start && start - now > horizon) return;
+      if (opts.window) { if ((end && end < opts.window.from) || (start && start > opts.window.to)) return; }
+      else {
+        if (end && end < now) return;
+        if (start && start - now > horizon) return;
+      }
       const label = (p.kind === 'BASE' ? 'TAF' : p.kind + (p.prob ? ' PROB' + p.prob : '')) + ' ' + brfHHMM(start) + '-' + brfHHMM(end);
       const sub = brfSnapFlags(p.kind === 'BASE' || p.kind === 'FM' || p.kind === 'BECMG' ? p : p, rules, label);
       // Periods inherit nothing from the base group in this simple decoder, so only
@@ -2199,6 +2202,10 @@ function brfAnalyse(data, opts) {
       flags.push(...sub);
     });
   }
+  if (opts.window && taf && taf.to && taf.to < opts.window.to)
+    flags.push({sev:'warn', text:'TAF expires at ' + brfHHMM(taf.to) + ' - before the end of the period you need it for (' + brfHHMM(opts.window.to) + '). Get an updated TAF before relying on it.', when:'forecast'});
+  if (opts.window && taf && taf.from && taf.from > opts.window.from)
+    flags.push({sev:'warn', text:'TAF only starts at ' + brfHHMM(taf.from) + ' - nothing forecast for the start of the period (' + brfHHMM(opts.window.from) + ').', when:'forecast'});
   // merge identical hazards across periods
   const merged = [];
   flags.forEach(f => {
@@ -2381,6 +2388,682 @@ function brfRender(main) {
 }
 
 
+// ================= DISPATCH PACK (flight plan + weather folder import) =================
+// ─── DISPATCH PACK: PDF TEXT EXTRACTION ──────────────────────────────────────
+// Runs entirely on the device with the pdf.js already loaded for document
+// scanning. Rebuilds readable lines from pdf.js text items and handles pages
+// laid out in two columns (e.g. the NOTAM pages), so columns are not interleaved.
+
+// Find a vertical white band near the page middle that no text crosses; if there is
+// one, the page is two columns and the band's centre is the split point.
+function dpxColumnSplit(items, pageWidth) {
+  const lo = pageWidth * 0.30, hi = pageWidth * 0.70, step = 2;
+  const cover = new Array(Math.ceil(pageWidth / step) + 1).fill(0);
+  items.forEach(i => {
+    const x0 = i.x, x1 = i.x + Math.max(i.w, 1);
+    for (let x = Math.floor(x0 / step); x <= Math.floor(x1 / step) && x < cover.length; x++) cover[x]++;
+  });
+  let best = null, runStart = null;
+  for (let x = Math.floor(lo / step); x <= Math.ceil(hi / step); x++) {
+    if (cover[x] === 0) { if (runStart === null) runStart = x; }
+    else if (runStart !== null) { if (!best || x - runStart > best.len) best = {start: runStart, len: x - runStart}; runStart = null; }
+  }
+  if (runStart !== null) { const x = Math.ceil(hi / step); if (!best || x - runStart > best.len) best = {start: runStart, len: x - runStart}; }
+  // need a clear band (>= 10 pt) and real text on both sides
+  if (!best || best.len * step < 10) return null;
+  const split = (best.start + best.len / 2) * step;
+  const left = items.filter(i => i.x < split).length, right = items.length - left;
+  return left >= 8 && right >= 8 ? split : null;
+}
+
+// Group items into lines by y, then order each line left to right.
+function dpxLines(items) {
+  const rows = [];
+  items.slice().sort((a, b) => b.y - a.y || a.x - b.x).forEach(i => {
+    const row = rows.find(r => Math.abs(r.y - i.y) <= 2.5);
+    if (row) row.items.push(i); else rows.push({y: i.y, items: [i]});
+  });
+  return rows.sort((a, b) => b.y - a.y).map(r => {
+    r.items.sort((a, b) => a.x - b.x);
+    let s = '', prevEnd = null;
+    r.items.forEach(i => {
+      if (prevEnd !== null) {
+        const gap = i.x - prevEnd;
+        s += gap > 14 ? '   ' : (gap > 1.2 || /^\s/.test(i.str) ? ' ' : '');
+      }
+      s += i.str.trim() === '' ? '' : i.str.replace(/\s+$/, '');
+      prevEnd = i.x + i.w;
+    });
+    return s.trim();
+  }).filter(Boolean);
+}
+
+async function dpxExtractPages(pdfjsLib, data) {
+  const pdf = await pdfjsLib.getDocument({data}).promise;
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const vp = page.getViewport({scale: 1});
+    const tc = await page.getTextContent();
+    const items = tc.items.filter(i => i.str && i.str.trim()).map(i => ({str: i.str, x: i.transform[4], y: i.transform[5], w: i.width || 0}));
+    const split = dpxColumnSplit(items, vp.width);
+    const lines = split === null ? dpxLines(items)
+      : [...dpxLines(items.filter(i => i.x < split)), ...dpxLines(items.filter(i => i.x >= split))];
+    pages.push({n: p, lines, text: lines.join('\n'), twoCol: split !== null});
+  }
+  return pages;
+}
+
+// ---- Dispatch pack parsing (runs on text from dpxExtractPages) --------------------
+// Everything is deterministic regex work on the dispatcher's standard layout. Anything the
+// parser cannot find is returned as null/[] and reported in `warnings`, never guessed.
+const DPX_MON = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+const DPX_ROLE_RE = /^(Departure|Destination|Alternate \d+|ETP Airport|Enroute airport)\b(.*?)\b([A-Z]{4}) - (.+)$/;
+
+function dpxClassify(pages) {
+  const all = pages.slice(0, 3).map(p => p.text).join('\n');
+  if (/International Flight Folder/.test(all) && /METEOROLOGICAL DATA FOR FLIGHT/.test(all)) return 'weather';
+  if (/^[A-Z]{4} . [A-Z]{4} \(\w{3} \d+, \d{4}\)/m.test(all) && /\bETD\b/.test(all)) return 'plan';
+  return 'unknown';
+}
+
+function dpxZ(y, mo, d, hhmm) { return new Date(Date.UTC(y, mo, d, +hhmm.slice(0, 2), +hhmm.slice(2, 4))); }
+
+// "METAR ● METAR FAOR 021000Z ..." / "METAR ● 021000Z ..." -> "METAR FAOR 021000Z ..."
+function dpxMetarString(icao, rest) {
+  rest = rest.replace(/^METAR\s+/, '').replace(/^SPECI\s+/, '').trim();
+  if (!rest || /^No METAR/i.test(rest) || /NO DATA AVAILABLE/i.test(rest)) return null;
+  if (!rest.startsWith(icao)) rest = icao + ' ' + rest;
+  return 'METAR ' + rest;
+}
+
+function dpxParsePlan(pages) {
+  const warnings = [];
+  const lines = pages.flatMap(p => p.lines.map(l => ({l, n: p.n})));
+  const first = pages[0].lines;
+  const out = {kind: 'plan', warnings, stations: [], sigmets: [], noSigmetFirs: [], notams: [], firs: [], etps: []};
+
+  const h = first[0].match(/^([A-Z]{4}) . ([A-Z]{4}) \((\w{3}) (\d+), (\d{4})\)(?: in (\S+) as (\S+) \(([^)]*)\) (\w+))?/);
+  if (!h) { warnings.push('Flight plan header not recognised'); return out; }
+  out.dep = h[1]; out.arr = h[2];
+  out.year = +h[5]; out.month = DPX_MON[h[3]]; out.day = +h[4];
+  out.callsign = h[7] || null; out.acType = h[8] || null; out.rules = h[9] || null;
+  const cr = first[0].match(/Created (\w{3}) (\d+) (\d{4}) (\d{4})Z/);
+  out.created = cr ? dpxZ(+cr[3], DPX_MON[cr[1]], +cr[2], cr[4]) : null;
+
+  const tl = first.find(l => /\bETD\b/.test(l) === false && /\d+NM/.test(l) && /\d{4}Z.*\d{4}Z/.test(l));
+  if (tl) {
+    const z = [...tl.matchAll(/(\d{4})Z/g)].map(m => m[1]);
+    out.etd = dpxZ(out.year, out.month, out.day, z[0]);
+    out.eta = dpxZ(out.year, out.month, out.day, z[1]);
+    if (out.eta < out.etd) out.eta = new Date(out.eta.getTime() + 86400000);
+    const e = tl.match(/^(\d+)h(\d+)m\s+(\d+)NM/); if (e) { out.eteMin = +e[1] * 60 + +e[2]; out.distNM = +e[3]; }
+    const fl = tl.match(/\bFL(\d{3})\b/); if (fl) out.cruiseFL = +fl[1];
+  } else warnings.push('ETD/ETA row not found');
+
+  const ri = first.findIndex(l => l === 'Route'), rj = first.findIndex(l => /^Route ID/.test(l));
+  if (ri >= 0) {
+    out.route = first.slice(ri + 1, rj > ri ? rj : ri + 3).map(x => x.replace(/\s+INFO\s*$/, '')).join(' ').replace(/\s+/g, ' ').trim();
+    const idm = first.find(l => /^Route ID/.test(l)); out.routeId = idm ? idm.replace(/^Route ID\s+/, '') : null;
+  }
+  const alt = first.find(l => /^ALTN\b/.test(l));
+  const altIcao = first.slice(first.findIndex(l => /^Alternate Fuel/.test(l))).find(l => /^[A-Z]{4}$/.test(l));
+  out.alternate = (alt && (alt.match(/\b([A-Z]{4})\b\s+\d{3,5}\b/) || [])[1]) || altIcao || null;
+  const fuel = lines.find(x => /^Total\s+\d+\s+\d+:\d+/.test(x.l));
+  if (fuel) { const m = fuel.l.match(/^Total\s+(\d+)\s+(\d+):(\d+)/); out.fuelKg = +m[1]; out.endurMin = +m[2] * 60 + +m[3]; }
+  const pic = first.findIndex(l => /^PIC\s/.test(l));
+  if (pic >= 0) out.pic = (first[pic].replace(/^PIC\s+/, '') + ' ' + (/^[A-Z][a-z]/.test(first[pic + 1] || '') ? first[pic + 1] : '')).trim();
+
+  // ETP windows ("ETP ALTN FZAA 1327Z - 1555Z ...")
+  lines.forEach(x => {
+    const m = x.l.match(/^ETP ALTN\s+([A-Z]{4})\s+(\d{4})Z - (\d{4})Z/);
+    if (m) out.etps.push({icao: m[1], from: dpxZ(out.year, out.month, out.day, m[2]), to: dpxZ(out.year, out.month, out.day, m[3])});
+  });
+  // FIR crossing table from the ETP page: "FZZA - KINSHASA  0:14 1124Z 1128Z 35NM"
+  const seen = new Set();
+  lines.forEach(x => {
+    for (const m of x.l.matchAll(/\b(F[A-Z]{3}) - ([A-Z]+)\s+(?:-|\d+:\d+)\s+(\d{4})Z (\d{4})Z\s+(\d+)NM/g)) {
+      const key = m[1] + m[3] + m[4]; if (seen.has(key)) continue; seen.add(key);
+      let a = dpxZ(out.year, out.month, out.day, m[3]), b = dpxZ(out.year, out.month, out.day, m[4]);
+      if (out.etd && a < out.etd - 3600000) a = new Date(a.getTime() + 86400000);
+      if (b < a) b = new Date(b.getTime() + 86400000);
+      out.firs.push({fir: m[1], name: m[2], from: a, to: b});
+    }
+  });
+  out.firs.sort((p, q) => p.from - q.from);
+  if (!out.firs.length) warnings.push('FIR crossing times not found');
+
+  // ---- METARs / TAFs section ----
+  const wi = lines.findIndex(x => x.l === 'METARs / TAFs');
+  if (wi < 0) warnings.push('METARs / TAFs section not found');
+  else {
+    let cur = null, inTaf = false;
+    for (let i = wi + 2; i < lines.length; i++) {
+      const l = lines[i].l;
+      if (/^SIGMETs \/ AIRMETs/.test(l) || /^(RESTRICTIONS|NOTAMs)$/.test(l)) break;
+      let m = l.match(DPX_ROLE_RE);
+      if (m) {
+        const t = m[2].match(/\((\d{4})Z\)/);
+        cur = {role: m[1].replace(/^Alternate \d+/, 'Alternate').replace('ETP Airport', 'ETP').replace('Enroute airport', 'Enroute'),
+               roleFull: m[1], icao: m[3], name: m[4].trim(), planTime: t ? dpxZ(out.year, out.month, out.day, t[1]) : null,
+               metarRaw: null, tafRaw: null, roles: []};
+        const prior = out.stations.find(s => s.icao === cur.icao);
+        if (prior) { prior.roles.push(m[1]); cur = null; } else { cur.roles.push(m[1]); out.stations.push(cur); }
+        inTaf = false; continue;
+      }
+      if (!cur) continue;
+      if (/^METAR\s+●/.test(l)) { cur.metarRaw = dpxMetarString(cur.icao, l.replace(/^METAR\s+●\s*/, '')); inTaf = false; }
+      else if (/^TAF\s+●/.test(l)) { const r = l.replace(/^TAF\s+●\s*/, '').trim(); cur.tafRaw = /^No TAF/i.test(r) ? null : 'TAF ' + cur.icao + ' ' + r; inTaf = true; }
+      else if (inTaf && l.startsWith('●') && cur.tafRaw) cur.tafRaw += ' ' + l.replace(/^●\s*/, '');
+    }
+  }
+  if (out.stations.length && !out.stations.some(s => s.metarRaw)) warnings.push('No METARs found in the flight plan');
+
+  // ---- SIGMETs ----
+  const si = lines.findIndex(x => /^SIGMETs \/ AIRMETs/.test(x.l));
+  if (si >= 0) {
+    let blk = null;
+    for (let i = si + 1; i < lines.length; i++) {
+      const l = lines[i].l;
+      if (/^(RESTRICTIONS|NOTAMs|SCENARIO)/.test(l)) break;
+      if (/^WX: Page/.test(l)) continue;
+      const nf = l.match(/^No SIGMET\/AIRMET found for (.+)$/); if (nf) { out.noSigmetFirs = nf[1].split(/,\s*/); continue; }
+      const m = l.match(/^([A-Z]{4}) (SIGMET|AIRMET) (\w+) VALID (\d{2})(\d{4})\/(\d{2})(\d{4})/);
+      if (m) {
+        const mk = (d, hm) => { const dt = dpxZ(out.year, out.month, +d, hm); return dt; };
+        blk = {fir: m[1], type: m[2], id: m[3], from: mk(m[4], m[5]), to: mk(m[6], m[7]), lines: [l]};
+        if (blk.to < blk.from) blk.to = new Date(Date.UTC(out.year, out.month + 1, +m[6], +m[7].slice(0, 2), +m[7].slice(2)));
+        out.sigmets.push(blk);
+        if (/=\s*$/.test(l)) blk = null; continue;
+      }
+      if (blk) { blk.lines.push(l); if (/=\s*$/.test(l)) blk = null; }
+    }
+    out.sigmets.forEach(s => {
+      s.text = s.lines.join(' ').replace(/\s+/g, ' ').replace(/=\s*$/, '');
+      const ph = s.text.match(/\b(OBSC TS|EMBD TS|FRQ TS|SQL TS|TS|SEV TURB|SEV ICE|MTW|VA|TC|RDOACT CLD|SEV MTW|HVY DS|HVY SS)\b/);
+      s.phenomenon = ph ? ph[1] : null;
+      s.top = (s.text.match(/\bTOP (?:ABV )?(FL\d{3})/) || [])[1] || null;
+      s.status = (s.text.match(/\b(INTSF|WKN|NC)\b/) || [])[1] || null;
+      s.coords = [...s.text.matchAll(/([NS])(\d{2})(\d{2}) ?([EW])(\d{3})(\d{2})/g)].map(c =>
+        ({lat: (c[1] === 'S' ? -1 : 1) * (+c[2] + +c[3] / 60), lon: (c[4] === 'W' ? -1 : 1) * (+c[5] + +c[6] / 60)}));
+      delete s.lines;
+    });
+  } else warnings.push('SIGMET section not found');
+
+  // ---- NOTAMs ----
+  const ni = lines.findIndex(x => x.l === 'NOTAMs');
+  if (ni < 0) warnings.push('NOTAM section not found');
+  else {
+    let section = null, cur = null, pendingTitle = null;
+    const TITLE_RE = /^[A-Z][A-Z \/\-,&']{6,60}$/;
+    const flush = () => {
+      if (!cur) return;
+      let rawLines = cur.raw;
+      // the next NOTAM's heading sits at the end of this one's text - hand it over
+      const tail = rawLines.length >= 2 && TITLE_RE.test(rawLines[rawLines.length - 1]) && / /.test(rawLines[rawLines.length - 1]) ? rawLines[rawLines.length - 1] : null;
+      if (tail) rawLines = rawLines.slice(0, -1);
+      cur.nextTitle = tail;
+      const t = rawLines.join('\n');
+      // fields appear in order Q A B C D E F G, sometimes several to a line
+      const order = ['Q', 'A', 'B', 'C', 'D', 'E', 'F', 'G'], pos = {};
+      let from = 0;
+      order.forEach(k => {
+        const m = new RegExp('(^|\\s)' + k + '\\) ?', 'g'); m.lastIndex = k === 'Q' ? 0 : from;
+        const r = m.exec(t); if (r) { pos[k] = {s: r.index + r[1].length, v: m.lastIndex}; if (k !== 'Q') from = m.lastIndex; }
+      });
+      const ks = Object.keys(pos).sort((x, y) => pos[x].s - pos[y].s);
+      const fld = k => { if (!pos[k]) return null; const nx = ks.find(x => pos[x].s > pos[k].s); return t.slice(pos[k].v, nx ? pos[nx].s : t.length).replace(/\s+/g, ' ').trim() || null; };
+      cur.q = fld('Q'); cur.loc = fld('A'); cur.b = fld('B'); cur.c = fld('C'); cur.d = fld('D'); cur.e = fld('E');
+      cur.f = fld('F'); cur.g = fld('G');
+      if (cur.g) cur.g = (cur.g.match(/^(?:\d+\s?FT\s?(?:AMSL|AGL)|FL\d{3}|UNL|GND|SFC)/) || [cur.g])[0];
+      if (cur.f) cur.f = (cur.f.match(/^(?:\d+\s?FT\s?(?:AMSL|AGL)|FL\d{3}|UNL|GND|SFC)/) || [cur.f])[0];
+      if (!cur.title && cur.q) { const mq = cur.q.match(/^(\S+)\s+([A-Z][A-Z \/\-,&']{6,})$/); if (mq) { cur.q = mq[1]; cur.title = mq[2]; } }
+      cur.qcode = ((cur.q || '').match(/\/(Q[A-Z]{4})\//) || [])[1] || null;
+      cur.text = cur.e || '';
+      delete cur.nextTitle; delete cur.raw; out.notams.push(cur); cur = null;
+    };
+    for (let i = ni + 1; i < lines.length; i++) {
+      const l = lines[i].l;
+      let m = l.match(DPX_ROLE_RE);
+      if (m && /^(Departure|Destination|Alternate|ETP Airport|Enroute airport)/.test(l)) { flush(); section = {kind: 'aerodrome', key: m[3]}; pendingTitle = null; continue; }
+      if ((m = l.match(/^FIR ([A-Z]{4})$/))) { flush(); section = {kind: 'fir', key: m[1]}; pendingTitle = null; continue; }
+      if ((m = l.match(/^([A-Z]\d{4}\/\d{2}) (NOTAM[NRC])(?: ([A-Z]\d{4}\/\d{2}))?/))) {
+        const prevTitle = cur && cur.raw.length >= 2 && TITLE_RE.test(cur.raw[cur.raw.length - 1]) && / /.test(cur.raw[cur.raw.length - 1]) ? cur.raw[cur.raw.length - 1] : null;
+        const pend = pendingTitle; pendingTitle = null; flush(); cur = {title: prevTitle || pend, id: m[1], type: m[2], replaces: m[3] || null, section: section ? section.key : null, sectionKind: section ? section.kind : null, raw: []}; continue;
+      }
+      if (/^#####$/.test(l) || /^NOTAMs have been filtered/.test(l)) { continue; }
+      if (cur) cur.raw.push(l); else if (TITLE_RE.test(l) && / /.test(l)) pendingTitle = l;
+    }
+    flush();
+    out.notams.forEach(n => { if (n.type === 'NOTAMC') n.cancel = true; });
+    // keep the dedupe key (same id appears under several sections)
+    const seenId = new Set();
+    out.notams = out.notams.filter(n => { const k = n.id + '|' + n.section; if (seenId.has(k)) return false; seenId.add(k); return true; });
+  }
+  return out;
+}
+
+// Weather folder: METAR/TAF lines "METAR FAOR 011600Z ... =" with wrapped continuation lines.
+function dpxParseFolder(pages) {
+  const warnings = [];
+  const out = {kind: 'weather', warnings, stations: [], sigmets: []};
+  const p1 = pages[0].lines;
+  const g = re => { const l = p1.find(x => re.test(x)); return l ? l.replace(re, '').trim() : null; };
+  out.flight = p1[2] && /^[A-Z]{2}\d+/.test(p1[2]) ? p1[2] : null;
+  const dep = g(/^Departure\s+/), dst = g(/^Destination\s+/);
+  out.dep = dep ? dep.slice(0, 4) : null; out.arr = dst ? dst.slice(0, 4) : null;
+  const dl = g(/^Date\s+/);
+  const dm = dl && dl.match(/(\w{3}) (\d+) (\d{2}):(\d{2}):\d{2} (\d{4})Z/);
+  out.issued = dm ? new Date(Date.UTC(+dm[5], DPX_MON[dm[1]], +dm[2], +dm[3], +dm[4])) : null;
+  const etd = g(/^ETD\s+/); out.etdHHMM = etd ? etd.slice(0, 4) : null;
+  if (out.issued && out.etdHHMM) {
+    let e = new Date(Date.UTC(out.issued.getUTCFullYear(), out.issued.getUTCMonth(), out.issued.getUTCDate(), +out.etdHHMM.slice(0, 2), +out.etdHHMM.slice(2)));
+    if (e < out.issued - 6 * 3600000) e = new Date(e.getTime() + 86400000);
+    out.etd = e;
+  }
+  const ete = g(/^ETE\s+/); out.eteMin = ete && /^\d{4}/.test(ete) ? +ete.slice(0, 2) * 60 + +ete.slice(2, 4) : null;
+
+  const lines = pages.flatMap(p => p.lines);
+  let role = null, cur = null, buf = null;
+  const done = () => {
+    if (!buf) return;
+    const raw = buf.text.replace(/\s+/g, ' ').replace(/([+-]) (?=[A-Z]{2})/g, '$1').trim();
+    if (/NO DATA AVAILABLE/i.test(raw)) { if (!out.stations.find(s => s.icao === buf.icao)) out.stations.push({icao: buf.icao, role: buf.role, name: buf.name || '', metarRaw: null, tafRaw: null}); buf = null; return; }
+    const st = out.stations.find(s => s.icao === buf.icao) || (out.stations.push({icao: buf.icao, role: buf.role, name: buf.name || '', metarRaw: null, tafRaw: null}), out.stations[out.stations.length - 1]);
+    if (buf.type === 'METAR') st.metarRaw = raw.replace(/=+$/, ''); else st.tafRaw = raw.replace(/=+$/, '');
+    buf = null;
+  };
+  const roleFor = h => /^Departure/.test(h) ? 'Departure' : /^Destination/.test(h) ? 'Destination' : 'Alternate';
+  let started = false;
+  for (const l of lines) {
+    if (/^METAR\/TAF$/.test(l)) { started = true; continue; }
+    if (!started) continue;
+    if (/^(SIGWX|SIGMET|WIND|FIXED TIME|Vertical Cross)/.test(l)) { done(); if (/^SIGMET/.test(l)) break; }
+    if (/^(Departure|Destination|Alternates\/En-route)$/.test(l)) { done(); role = roleFor(l); continue; }
+    const hd = l.match(/^([A-Z]{4})\/[A-Z]{3}\/[^/]*\/(.*)$/);
+    if (hd) { done(); cur = {icao: hd[1], name: hd[2]}; continue; }
+    if (cur) {
+      const m = l.match(/^(METAR|SPECI|TAF)\s+([A-Z]{4})\b(.*)$/);
+      if (m) { done(); buf = {type: m[1] === 'TAF' ? 'TAF' : 'METAR', icao: m[2], role, name: cur.name, text: l}; if (/=\s*$/.test(l)) done(); continue; }
+      if (buf) { buf.text += ' ' + l; if (/=\s*$/.test(l)) done(); }
+    }
+  }
+  done();
+  // fix: FIR/aerodrome headings without METAR data (e.g. "NIL")
+  out.stations.forEach(s => { if (!s.metarRaw) s.metarRaw = null; });
+  if (!out.stations.length) warnings.push('No METAR/TAF records found in the weather folder');
+  return out;
+}
+
+// ---- Dispatch pack cross-checks (deterministic; every finding explains itself) ------------
+const DPX_WINDOW_MIN = {dep: [-30, 60], dest: [-60, 60], alt: [0, 120], etp: [-60, 60]};
+const dpxMin = n => n * 60000;
+const dpxFmtZ = d => d ? String(d.getUTCHours()).padStart(2, '0') + String(d.getUTCMinutes()).padStart(2, '0') + 'Z' : '?';
+const dpxFmtDZ = d => d ? String(d.getUTCDate()).padStart(2, '0') + '/' + dpxFmtZ(d) : '?';
+
+// ICAO NOTAM date "2610270500" (YYMMDDHHMM) -> Date; returns null for PERM/UFN/EST-suffixed text it can't read
+function dpxNotamDate(s) {
+  const m = s && s.match(/^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+  return m ? new Date(Date.UTC(2000 + +m[1], +m[2] - 1, +m[3], +m[4], +m[5])) : null;
+}
+
+function dpxWindowFor(plan, st) {
+  const roles = st.roles || [st.role];
+  const w = (a, b, w0) => ({from: new Date(a.getTime() + dpxMin(w0[0])), to: new Date(b.getTime() + dpxMin(w0[1])), why: ''});
+  const out = [];
+  if (roles.some(r => /Departure/.test(r))) out.push({...w(plan.etd, plan.etd, DPX_WINDOW_MIN.dep), why: 'departure ±'});
+  if (roles.some(r => /Destination/.test(r))) out.push({...w(plan.eta, plan.eta, DPX_WINDOW_MIN.dest), why: 'arrival'});
+  if (roles.some(r => /Alternate/.test(r))) out.push({...w(plan.eta, plan.eta, DPX_WINDOW_MIN.alt), why: 'alternate (ETA to ETA+2h)'});
+  if (roles.some(r => /ETP/.test(r))) {
+    const e = plan.etps.find(x => x.icao === st.icao);
+    if (e) out.push({...w(e.from, e.to, DPX_WINDOW_MIN.etp), why: 'ETP window'});
+  }
+  if (roles.some(r => /Enroute/.test(r))) out.push({from: plan.etd, to: plan.eta, why: 'whole flight'});
+  if (!out.length) return null;
+  return {from: new Date(Math.min(...out.map(x => x.from))), to: new Date(Math.max(...out.map(x => x.to))), why: out.map(x => x.why).join(' + ')};
+}
+
+function dpxNotamSeverity(n, isAerodromeOnRoute) {
+  const t = (n.text + ' ' + (n.title || '')).toUpperCase();
+  if (n.type === 'NOTAMC') return null;
+  if (isAerodromeOnRoute) {
+    if (/\b(AD|AERODROME|AIRPORT)\b.{0,40}\b(CLSD|CLOSED)\b/.test(t) || /\bRWY\b.{0,30}\b(CLSD|CLOSED)\b/.test(t) && !/\bTWY\b/.test(t.split('RWY')[0]))
+      return ['bad', 'Closure'];
+    if (/\b(ILS|LOC|GP|GLIDE|VOR|DME|NDB|RNAV|RNP|GNSS|PAPI|VASI|APCH LGT|ALS|RADAR|ATIS)\b.{0,60}\b(U\/S|UNSERVICEABLE|NOT AVBL|UNAVAILABLE|WITHDRAWN|OUT OF SERVICE|SUSPENDED)\b/.test(t) ||
+        /\b(U\/S|UNSERVICEABLE|NOT AVBL|WITHDRAWN)\b.{0,60}\b(ILS|LOC|GP|VOR|DME|NDB|PAPI|APCH)/.test(t)) return ['warn', 'Nav-aid / approach aid'];
+    if (/\b(FUEL|JET A1|AVTUR)\b/.test(t) && /\b(NOT AVBL|UNAVAILABLE|U\/S|LIMITED)\b/.test(t)) return ['warn', 'Fuel'];
+    if (/\b(RFF|ARFF|FIRE CAT|FIREFIGHTING|CAT \d+ RFF)\b/.test(t)) return ['warn', 'Rescue/fire category'];
+    if (/\b(RWY|RUNWAY)\b.{0,50}\b(WIP|WORK IN PROGRESS|CONSTRUCTION|SHORTENED|REDUCED|DISPLACED|DECLARED DISTANCES|RESURFAC)/.test(t) || /\bWIP\b.{0,40}\bRWY\b/.test(t)) return ['warn', 'Runway works / reduced distances'];
+    if (/\b(TWY|TAXIWAY|APRON|STAND|GATE)\b.{0,50}\b(CLSD|CLOSED|WIP|RESTRICTED|NOT AVBL)\b/.test(t)) return ['info', 'Taxiway / apron'];
+    if (/\b(BIRD|WILDLIFE|OBST|CRANE|CURFEW|NOISE|PPR)\b/.test(t)) return ['info', 'Obstacle / bird / curfew'];
+    return ['info', 'Other'];
+  }
+  // FIR-level
+  if (/\b(AIRSPACE|FIR|AIRWAY|ATS ROUTE|ROUTE)\b.{0,50}\b(CLSD|CLOSED|NOT AVBL|PROHIBITED)\b/.test(t) || /\b(DANGER|RESTRICTED|PROHIBITED) AREA\b.{0,60}\b(ACTIVE|ACT)\b/.test(t) || /\b(MIL(ITARY)? (EXERCISE|ACTIVITY)|MISSILE|ROCKET|LASER|SPACE (DEBRIS|LAUNCH)|GNSS (INTERFERENCE|JAMMING|UNRELIABLE))\b/.test(t))
+    return ['warn', 'Airspace restriction / activity'];
+  if (/\b(UAS|UAV|UNMANNED|DRONE|RPAS|BALLOON|PARACHUT|GLIDER|AEROBATIC|FIREWORK)\b/.test(t)) return ['info', 'Low-level activity (unmanned / parachute / etc.)'];
+  return ['info', 'Other'];
+}
+
+// Main entry: plan (required) + weather folder (optional) -> everything the UI shows.
+function dpxBuildPack(plan, folder, opts) {
+  opts = opts || {};
+  const now = opts.now || new Date();
+  const findings = [];  // {sev, area, text}
+  const F = (sev, area, text) => findings.push({sev, area, text});
+
+  // --- pack-level checks
+  if (plan.etd && plan.created) {
+    const lead = (plan.etd - plan.created) / 3600000;
+    if (lead > 3) F('warn', 'Plan', 'Flight plan was created ' + lead.toFixed(1) + ' h before ETD - weather and NOTAMs may have changed. Re-check close to departure.');
+  }
+  if (folder) {
+    const sameWay = folder.dep === plan.dep && folder.arr === plan.arr, reverse = folder.dep === plan.arr && folder.arr === plan.dep;
+    if (!sameWay) F('bad', 'Pack', 'The weather folder is for ' + (folder.dep || '?') + ' → ' + (folder.arr || '?') + (folder.flight ? ' (' + folder.flight + ')' : '') + ' but the flight plan is ' + plan.dep + ' → ' + plan.arr + (reverse ? ' - this is the reverse sector.' : '.') + ' These two documents are not for the same flight.');
+    if (folder.etd && plan.etd && Math.abs(folder.etd - plan.etd) > 3 * 3600000)
+      F('bad', 'Pack', 'Weather folder is for an ETD of ' + dpxFmtDZ(folder.etd) + ' but the flight plan ETD is ' + dpxFmtDZ(plan.etd) + ' - different day or time.');
+    const missing = plan.stations.filter(s => !folder.stations.some(f => f.icao === s.icao)).map(s => s.icao);
+    if (sameWay && missing.length) F('warn', 'Pack', 'In the plan but missing from the weather folder: ' + missing.join(', '));
+  }
+
+  // --- per-station weather
+  const wxStations = plan.stations.map(st => {
+    const win = dpxWindowFor(plan, st);
+    const rules = plan.rules === 'VFR' ? 'VFR' : 'IFR';
+    const an = brfAnalyse({icao: st.icao, role: st.roles.join(' + '), metarRaw: st.metarRaw, tafRaw: st.tafRaw, elevM: null}, {now: plan.created || now, rules, window: win || undefined, horizonH: 12});
+    an.window = win; an.source = 'plan'; an.roles = st.roles; an.name = st.name;
+    // METAR age at the time it is needed
+    const ref = st.roles.some(r => /Departure/.test(r)) ? plan.etd : null;
+    if (ref) an.flags = an.flags.filter(f => !/^METAR is \d+ minutes old/.test(f.text));
+    if (ref && an.metar && an.metar.obsTime) {
+      const age = Math.round((ref - an.metar.obsTime) / 60000);
+      if (age > 60) an.flags.unshift({sev: age > 120 ? 'warn' : 'info', text: 'METAR will be ' + age + ' min old at ETD (observed ' + dpxFmtDZ(an.metar.obsTime) + ', ETD ' + dpxFmtZ(plan.etd) + ') - get a fresh one before departure.', when: 'now'});
+    }
+    if (!st.tafRaw) an.flags.unshift({sev: st.roles.some(r => /Destination|Alternate/.test(r)) ? 'warn' : 'info', text: 'No TAF in the plan for this aerodrome.', when: 'forecast'});
+    an.worst = an.flags.some(f => f.sev === 'bad') ? 'bad' : an.flags.some(f => f.sev === 'warn') ? 'warn' : 'ok';
+    return an;
+  });
+
+  // --- folder stations (analysed relative to folder issue time/ETD)
+  const folderStations = folder ? folder.stations.map(st => {
+    const ref = folder.issued || now;
+    const win = folder.etd ? {from: new Date(folder.etd.getTime() - dpxMin(60)), to: new Date(folder.etd.getTime() + dpxMin((folder.eteMin || 0) + 60)), why: 'flight window'} : null;
+    const an = brfAnalyse({icao: st.icao, role: st.role, metarRaw: st.metarRaw, tafRaw: st.tafRaw, elevM: null}, {now: ref, rules: 'IFR', window: win || undefined, horizonH: 12});
+    an.window = win; an.source = 'folder'; an.roles = [st.role]; an.name = st.name;
+    return an;
+  }) : [];
+
+  // --- SIGMETs vs FIR crossing times
+  const sigmets = plan.sigmets.map(s => {
+    const crossings = plan.firs.filter(f => f.fir === s.fir);
+    let verdict, sev;
+    if (!crossings.length) { verdict = 'Your route does not cross this FIR per the plan.'; sev = 'info'; }
+    else {
+      const ov = crossings.filter(c => c.from < s.to && c.to > s.from);
+      if (ov.length) {
+        sev = /TS|TURB|ICE|VA|TC|MTW|DS|SS|RDOACT/.test(s.phenomenon || '') ? 'bad' : 'warn';
+        verdict = 'You are in ' + s.fir + ' from ' + dpxFmtZ(ov[0].from) + ' to ' + dpxFmtZ(ov[ov.length - 1].to) + ', which overlaps the SIGMET validity. Compare the polygon with your track.';
+      } else {
+        const c0 = crossings[0];
+        sev = 'info';
+        verdict = c0.from >= s.to ? 'Expires at ' + dpxFmtZ(s.to) + ', before you enter the FIR at ' + dpxFmtZ(c0.from) + ' - check for a replacement SIGMET before departure.'
+                                  : 'Valid from ' + dpxFmtZ(s.from) + ', after you leave the FIR.';
+      }
+    }
+    if (sev !== 'info') F(sev, 'SIGMET', s.fir + ' SIGMET ' + s.id + ' (' + (s.phenomenon || 'see text') + (s.top ? ' top ' + s.top : '') + (s.status ? ', ' + s.status : '') + '): ' + verdict);
+    else if (crossings.length) F('info', 'SIGMET', s.fir + ' SIGMET ' + s.id + ': ' + verdict);
+    return {...s, verdict, sev};
+  });
+
+  // --- NOTAMs
+  const aeroSet = new Set(plan.stations.map(s => s.icao));
+  const notams = plan.notams.map(n => {
+    const isAd = n.sectionKind === 'aerodrome';
+    const sv = dpxNotamSeverity(n, isAd);
+    const b = dpxNotamDate(n.b), c = dpxNotamDate(n.c);
+    let note = null;
+    if (c && plan.etd && c < plan.etd && !/EST|PERM|UFN/.test(n.c || '')) note = 'Expired before ETD';
+    else if (b && plan.eta && b > plan.eta) note = 'Starts after ETA';
+    return {...n, sev: n.type === 'NOTAMC' ? 'info' : (sv ? sv[0] : 'info'), kind: sv ? sv[1] : 'Cancellation', note, bDate: b, cDate: c};
+  });
+  const nb = notams.filter(n => n.sev === 'bad').length, nw = notams.filter(n => n.sev === 'warn').length;
+  if (nb) F('bad', 'NOTAM', nb + ' NOTAM' + (nb > 1 ? 's' : '') + ' look like closures at aerodromes on your plan - read them.');
+  if (nw) F('warn', 'NOTAM', nw + ' NOTAM' + (nw > 1 ? 's' : '') + ' mention nav-aid / runway / fuel / airspace issues.');
+  if (plan.notams.length) F('info', 'NOTAM', plan.notams.length + ' NOTAMs in the pack. Flags come from keyword matching - they help you find the important ones but do NOT replace reading all of them.');
+
+  // roll up station problems into findings
+  wxStations.forEach(a => {
+    a.flags.filter(f => f.sev !== 'info').slice(0, 3).forEach(f => F(f.sev, a.icao, f.text + (f.when && f.when !== 'now' ? ' [' + f.when + ']' : '')));
+  });
+  const rank = {bad: 0, warn: 1, info: 2};
+  findings.sort((a, b) => rank[a.sev] - rank[b.sev]);
+
+  return {plan, folder, stations: wxStations, folderStations, sigmets, notams, findings,
+          worst: findings.some(f => f.sev === 'bad') ? 'bad' : findings.some(f => f.sev === 'warn') ? 'warn' : 'ok'};
+}
+
+// What the logbook "new flight" form can be pre-filled with. Only things the documents state.
+function dpxLogPrefill(pack) {
+  const p = pack.plan, f = pack.folder;
+  const sameWay = f && f.dep === p.dep && f.arr === p.arr;
+  const hhmm = d => d ? String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0') : '';
+  return {
+    date: p.etd ? p.etd.toISOString().slice(0, 10) : '',
+    dep_airport: p.dep, arr_airport: p.arr, route: p.route || '',
+    flight_number: sameWay && f.flight ? f.flight : '',
+    aircraft_type: (p.acType || '').split(' ')[0] || '',
+    flight_rules: p.rules || '',
+    planned_off: hhmm(p.etd), planned_on: hhmm(p.eta),
+    remarks: 'Dispatch pack: ' + p.dep + '-' + p.arr + ', planned ETD ' + hhmm(p.etd) + 'Z, ETA ' + hhmm(p.eta) + 'Z' + (p.callsign ? ', callsign ' + p.callsign : '') + (p.eteMin ? ', planned ' + Math.floor(p.eteMin / 60) + 'h' + String(p.eteMin % 60).padStart(2, '0') : '') + '. Actual times to be entered after the flight.',
+  };
+}
+
+// ---- Dispatch tab UI ---------------------------------------------------------------------
+const DPX_LS = 'salogbook_dpx_last';
+
+function dpxState() {
+  if (!state.dpx) {
+    state.dpx = {loading: false, error: '', notes: [], pack: null, plan: null, folder: null, savedAt: null, showAllNotams: false};
+    try {
+      const s = JSON.parse(localStorage.getItem(DPX_LS) || 'null');
+      if (s) { dpxApply(state.dpx, s.planPages, s.folderPages); state.dpx.savedAt = s.savedAt; }
+    } catch (e) { /* stale or corrupt saved pack - ignore */ }
+  }
+  return state.dpx;
+}
+
+// Parse + cross-check from extracted page lines. Pure apart from writing into `d`.
+function dpxApply(d, planPages, folderPages) {
+  const wrap = ps => ps && ps.map(p => ({n: p.n, lines: p.lines, text: p.lines.join('\n')}));
+  d.planPages = planPages || null; d.folderPages = folderPages || null;
+  d.plan = planPages ? dpxParsePlan(wrap(planPages)) : null;
+  d.folder = folderPages ? dpxParseFolder(wrap(folderPages)) : null;
+  d.pack = d.plan && d.plan.dep ? dpxBuildPack(d.plan, d.folder) : null;
+}
+
+async function dpxLoadFiles(fileList) {
+  const d = dpxState();
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  if (!window.pdfjsLib) { d.error = 'The PDF reader has not loaded (it needs the internet the first time). Reload the app once while online.'; render(); return; }
+  d.loading = true; d.error = ''; d.notes = []; render();
+  try {
+    let planPages = d.planPages, folderPages = d.folderPages;
+    for (const f of files) {
+      if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') { d.notes.push(f.name + ': not a PDF - skipped.'); continue; }
+      const data = new Uint8Array(await f.arrayBuffer());
+      const pages = await dpxExtractPages(window.pdfjsLib, data);
+      const kind = dpxClassify(pages);
+      const slim = pages.map(p => ({n: p.n, lines: p.lines}));
+      if (kind === 'plan') { planPages = slim; d.notes.push(f.name + ': read as the flight plan (' + pages.length + ' pages).'); }
+      else if (kind === 'weather') { folderPages = slim; d.notes.push(f.name + ': read as the weather folder (' + pages.length + ' pages).'); }
+      else d.notes.push(f.name + ': not recognised as a flight plan or weather folder - skipped. Only the standard dispatch layout is supported.');
+    }
+    if (!planPages) { d.error = 'No flight plan found. Add the flight plan PDF (it starts with the route, e.g. "FZAA - FAOR") - the weather folder alone is not enough.'; }
+    dpxApply(d, planPages, folderPages);
+    if (d.pack) {
+      d.savedAt = Date.now();
+      try { localStorage.setItem(DPX_LS, JSON.stringify({planPages, folderPages, savedAt: d.savedAt})); } catch (e) { /* storage full - pack still works this session */ }
+    }
+  } catch (e) {
+    d.error = 'Could not read that PDF: ' + (e && e.message ? e.message : e);
+  }
+  d.loading = false; render();
+}
+
+function dpxClear() {
+  try { localStorage.removeItem(DPX_LS); } catch (e) {}
+  state.dpx = null; render();
+}
+
+function dpxLogThisFlight() {
+  const d = dpxState(); if (!d.pack) return;
+  const p = dpxLogPrefill(d.pack);
+  const f = {
+    id: 'new', date: p.date, duty_type: 'Flight Duty', flight_rules: p.flight_rules || 'IFR',
+    aircraft_type: p.aircraft_type, aircraft_reg: '', dep_airport: p.dep_airport, arr_airport: p.arr_airport, route: p.route,
+    total_time: 0, sim_time: 0, pic: 0, sic: 0, dual: 0, picus: 0, solo: 0, night: 0, ifr: 0, sim_inst: 0, xc: 0,
+    day_landings: 0, night_landings: 0, day_takeoffs: 0, night_takeoffs: 0, holds: 0, chocks_off: '', chocks_on: '',
+    pilot_role: '', duty_role: '', p1_name: '', p2_name: '', instructor: '', lesson: '', remarks: p.remarks, approaches: [],
+    flight_number: p.flight_number, actual_inst: 0, p1us: 0, p1us_night: 0, dual_given: 0, relief: 0,
+    relief_crew_name: '', sfi_sfe: 0, on_duty: '', off_duty: '', pilot_flying: false,
+    check_captain_name: '', autolands: 0, catii: 0, catiii: 0, rnav_approaches: 0, ils_approaches: 0,
+  };
+  setState({tab: 'log', showFlightForm: true, editFlight: f});
+}
+
+function dpxCard(kind, children, extra) {
+  const c = BRF_COL[kind] || BRF_COL.ok;
+  return div({style: {background: '#fff', border: '1px solid #DEE2E6', borderLeft: '5px solid ' + c.fg, borderRadius: '8px', padding: '14px 18px', marginBottom: '14px', ...(extra || {})}}, ...children);
+}
+
+function dpxFindingRow(f) {
+  const c = BRF_COL[f.sev];
+  return div({style: {background: c.bg, border: '1px solid ' + c.bd, color: c.fg, borderRadius: '6px', padding: '6px 10px', fontSize: '12px', marginBottom: '5px', lineHeight: '1.5'}},
+    el('b', {style: {fontFamily: 'monospace', marginRight: '6px'}}, f.area), f.text);
+}
+
+function dpxNotamRow(n) {
+  const c = BRF_COL[n.sev];
+  const row = el('details', {style: {background: n.sev === 'info' ? '#F8F9FA' : c.bg, border: '1px solid ' + (n.sev === 'info' ? '#E9ECEF' : c.bd), borderRadius: '6px', padding: '5px 10px', marginBottom: '4px', fontSize: '12px'}});
+  row.appendChild(el('summary', {style: {cursor: 'pointer', color: n.sev === 'info' ? '#444' : c.fg}},
+    el('b', {style: {fontFamily: 'monospace'}}, n.id), ' ' + (n.title || n.kind) + (n.loc && n.loc !== n.section ? ' [' + n.loc + ']' : '') + (n.note ? ' - ' + n.note : '')));
+  row.appendChild(el('pre', {style: {whiteSpace: 'pre-wrap', fontSize: '11px', margin: '6px 0 2px', color: '#333'}},
+    (n.b ? 'From ' + n.b : '') + (n.c ? '  To ' + n.c : '') + (n.d ? '\nSchedule: ' + n.d : '') + '\n' + n.text + ((n.f || n.g) ? '\nLevels: ' + (n.f || '?') + ' to ' + (n.g || '?') : '')));
+  return row;
+}
+
+function dpxRender(main) {
+  const d = dpxState();
+  main.appendChild(div({style: {marginBottom: '12px'}},
+    el('h2', {style: {margin: '0 0 4px', fontSize: '18px', color: '#1A1A1A'}}, 'Dispatch pack'),
+    el('p', {style: {color: '#555', fontSize: '12px', margin: 0}}, 'Add the flight plan and weather folder PDFs from dispatch. They are read on this phone only - nothing is uploaded - and the result stays available offline.')));
+
+  const picker = div({style: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '8px', padding: '14px 18px', marginBottom: '14px'}});
+  const fi = el('input', {type: 'file', accept: 'application/pdf,.pdf', multiple: 'multiple', style: {display: 'none'}});
+  fi.addEventListener('change', () => { const fl = Array.from(fi.files || []); fi.value = ''; dpxLoadFiles(fl); });
+  picker.appendChild(fi);
+  picker.appendChild(div({style: {display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center'}},
+    btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '8px', padding: '9px 18px', fontSize: '13px', fontWeight: '700', cursor: d.loading ? 'default' : 'pointer', opacity: d.loading ? '.5' : '1'}, ...(d.loading ? {disabled: true} : {}), onclick: () => fi.click()}, d.loading ? 'Reading...' : (d.pack ? 'Replace PDFs' : 'Choose PDFs')),
+    d.pack ? btn({style: {width: 'auto', background: '#fff', color: '#666', border: '1px solid #CED4DA', borderRadius: '8px', padding: '9px 14px', fontSize: '12px', cursor: 'pointer'}, onclick: dpxClear}, 'Clear') : null,
+    el('span', {style: {fontSize: '11px', color: '#888'}}, 'Select both PDFs at once, or add the second one later.')));
+  d.notes.forEach(n => picker.appendChild(div({style: {fontSize: '11px', color: '#555', marginTop: '6px'}}, n)));
+  main.appendChild(picker);
+  if (d.error) main.appendChild(div({style: {background: BRF_COL.bad.bg, border: '1px solid ' + BRF_COL.bad.bd, color: BRF_COL.bad.fg, borderRadius: '8px', padding: '10px 14px', fontSize: '12px', marginBottom: '14px', lineHeight: '1.5'}}, d.error));
+  if (!d.pack) return;
+
+  const pack = d.pack, p = pack.plan, k = BRF_COL[pack.worst];
+  const nBad = pack.findings.filter(f => f.sev === 'bad').length, nWarn = pack.findings.filter(f => f.sev === 'warn').length;
+  const fz = dd => dd ? String(dd.getUTCHours()).padStart(2, '0') + String(dd.getUTCMinutes()).padStart(2, '0') + 'Z' : '?';
+
+  // summary
+  main.appendChild(div({style: {background: k.bg, border: '1px solid ' + k.bd, borderLeft: '6px solid ' + k.fg, borderRadius: '10px', padding: '14px 18px', marginBottom: '14px'}},
+    div({style: {fontSize: '18px', fontWeight: '800', color: k.fg}}, nBad ? nBad + ' problem' + (nBad > 1 ? 's' : '') + ' to resolve before you go' : (nWarn ? nWarn + ' caution' + (nWarn > 1 ? 's' : '') + ' in this pack' : 'Nothing flagged')),
+    div({style: {fontFamily: 'monospace', fontSize: '13px', marginTop: '6px'}}, p.dep + ' → ' + p.arr + '  ' + (p.etd ? p.etd.toISOString().slice(0, 10) : '') + '  ETD ' + fz(p.etd) + '  ETA ' + fz(p.eta) + (p.eteMin ? '  (' + Math.floor(p.eteMin / 60) + 'h' + String(p.eteMin % 60).padStart(2, '0') + ', ' + (p.distNM || '?') + ' NM)' : '')),
+    div({style: {fontSize: '11px', color: '#555', marginTop: '4px'}}, [p.callsign, p.acType, p.rules, p.cruiseFL ? 'FL' + p.cruiseFL : null, p.alternate ? 'alternate ' + p.alternate : null].filter(Boolean).join(' - ')),
+    div({style: {fontSize: '11px', color: '#555', marginTop: '4px'}}, 'Checks are fixed rules on the documents\' own text. They help you spot issues - they do not replace reading the pack, and they are not a go/no-go decision.')));
+
+  // parser warnings
+  const pw = [...(p.warnings || []), ...((pack.folder && pack.folder.warnings) || [])];
+  pw.forEach(w => main.appendChild(dpxFindingRow({sev: 'warn', area: 'Read', text: w + ' - that part of the PDF was not understood, so it is not checked.'})));
+
+  // findings
+  const fcard = dpxCard(pack.worst, [el('div', {style: {fontWeight: '800', fontSize: '14px', marginBottom: '8px'}}, 'What needs your attention')]);
+  const shown = pack.findings.filter(f => f.sev !== 'info');
+  if (!shown.length) fcard.appendChild(div({style: {fontSize: '12px', color: '#555'}}, 'Nothing flagged by the checks.'));
+  shown.forEach(f => fcard.appendChild(dpxFindingRow(f)));
+  const infos = pack.findings.filter(f => f.sev === 'info');
+  if (infos.length) {
+    const det = el('details', {style: {marginTop: '6px'}}, el('summary', {style: {cursor: 'pointer', fontSize: '11px', color: '#0066CC'}}, infos.length + ' information note' + (infos.length > 1 ? 's' : '')));
+    infos.forEach(f => det.appendChild(dpxFindingRow(f)));
+    fcard.appendChild(det);
+  }
+  main.appendChild(fcard);
+
+  // route + fuel
+  const rd = el('details', {style: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '8px', padding: '10px 16px', marginBottom: '14px'}}, el('summary', {style: {cursor: 'pointer', fontWeight: '700', fontSize: '13px'}}, 'Route and fuel'));
+  rd.appendChild(el('pre', {style: {whiteSpace: 'pre-wrap', fontSize: '11px', margin: '8px 0 0', color: '#333'}},
+    (p.route || 'Route not found') + (p.fuelKg ? '\n\nMinimum required fuel ' + p.fuelKg + ' kg (' + Math.floor(p.endurMin / 60) + ':' + String(p.endurMin % 60).padStart(2, '0') + ')' : '') +
+    (p.pic ? '\nPIC ' + p.pic : '') + (p.firs.length ? '\n\nFIRs: ' + p.firs.map(f => f.fir + ' ' + fz(f.from) + '-' + fz(f.to)).join(' · ') : '')));
+  main.appendChild(rd);
+
+  // weather
+  main.appendChild(el('h3', {style: {margin: '4px 0 8px', fontSize: '15px'}}, 'Weather in the flight plan'));
+  main.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '8px'}}, 'Forecast periods are checked against the time you need each aerodrome (departure ±, arrival ±1 h, alternate ETA to +2 h, ETP window, enroute = whole flight).'));
+  pack.stations.forEach(a => {
+    const card = brfStationCard(a);
+    if (a.window) card.appendChild(div({style: {fontSize: '10px', color: '#888', marginTop: '6px'}}, 'Checked for ' + fz(a.window.from) + ' to ' + fz(a.window.to) + ' (' + a.window.why + ')'));
+    main.appendChild(card);
+  });
+
+  // SIGMETs
+  main.appendChild(el('h3', {style: {margin: '14px 0 8px', fontSize: '15px'}}, 'SIGMETs'));
+  if (!pack.sigmets.length) main.appendChild(div({style: {fontSize: '12px', color: '#555', marginBottom: '14px'}}, 'No SIGMETs in the pack' + (p.noSigmetFirs.length ? ' (none found for ' + p.noSigmetFirs.join(', ') + ')' : '') + '.'));
+  pack.sigmets.forEach(s => {
+    main.appendChild(dpxCard(s.sev === 'info' ? 'ok' : s.sev, [
+      div({style: {display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap'}},
+        div({}, el('b', {style: {fontFamily: 'monospace'}}, s.fir + ' ' + s.type + ' ' + s.id), el('span', {style: {fontSize: '11px', color: '#888', marginLeft: '8px'}}, 'valid ' + dpxFmtDZ(s.from) + ' - ' + dpxFmtDZ(s.to))),
+        brfChip(s.sev === 'bad' ? 'ON YOUR TRACK' : s.sev === 'warn' ? 'CHECK' : 'FYI', s.sev === 'info' ? 'ok' : s.sev)),
+      div({style: {fontSize: '12px', margin: '6px 0', lineHeight: '1.5'}}, s.verdict),
+      el('details', {}, el('summary', {style: {cursor: 'pointer', fontSize: '11px', color: '#0066CC'}}, 'Full text'), el('pre', {style: {whiteSpace: 'pre-wrap', fontSize: '11px', background: '#F8F9FA', padding: '8px', borderRadius: '6px'}}, s.text)),
+    ]));
+  });
+  if (p.noSigmetFirs.length && pack.sigmets.length) main.appendChild(div({style: {fontSize: '11px', color: '#666', margin: '-8px 0 14px'}}, 'No SIGMET/AIRMET found for ' + p.noSigmetFirs.join(', ') + '.'));
+
+  // NOTAMs
+  main.appendChild(el('h3', {style: {margin: '14px 0 8px', fontSize: '15px'}}, 'NOTAMs (' + pack.notams.length + ')'));
+  main.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '8px'}}, 'Coloured ones matched keywords such as closures, suspended procedures, nav-aid failures or runway works. Grey ones did not match - that does not mean they are irrelevant. Read them all.'));
+  const groups = [];
+  pack.notams.forEach(n => { let g = groups.find(x => x.key === n.section); if (!g) { g = {key: n.section, kind: n.sectionKind, items: []}; groups.push(g); } g.items.push(n); });
+  groups.forEach(g => {
+    const flagged = g.items.filter(n => n.sev !== 'info'), rest = g.items.filter(n => n.sev === 'info');
+    const roles = g.kind === 'aerodrome' ? ((pack.stations.find(s => s.icao === g.key) || {}).roles || []).join(' + ') : 'FIR';
+    const box = el('details', {open: flagged.length ? 'open' : undefined, style: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '8px', padding: '10px 16px', marginBottom: '10px'}});
+    if (!flagged.length) box.removeAttribute('open');
+    box.appendChild(el('summary', {style: {cursor: 'pointer', fontSize: '13px'}}, el('b', {style: {fontFamily: 'monospace'}}, g.key), ' ' + roles + ' - ' + g.items.length + ' NOTAM' + (g.items.length > 1 ? 's' : '') + (flagged.length ? ', ' + flagged.length + ' flagged' : '')));
+    const body = div({style: {marginTop: '8px'}});
+    flagged.forEach(n => body.appendChild(dpxNotamRow(n)));
+    if (rest.length > 12) {
+      const more = el('details', {}, el('summary', {style: {cursor: 'pointer', fontSize: '11px', color: '#0066CC', margin: '4px 0'}}, rest.length + ' not flagged'));
+      rest.forEach(n => more.appendChild(dpxNotamRow(n))); body.appendChild(more);
+    } else rest.forEach(n => body.appendChild(dpxNotamRow(n)));
+    box.appendChild(body); main.appendChild(box);
+  });
+
+  // weather folder
+  if (pack.folder) {
+    const fd = el('details', {style: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '8px', padding: '10px 16px', margin: '14px 0'}},
+      el('summary', {style: {cursor: 'pointer', fontWeight: '700', fontSize: '13px'}}, 'Weather folder ' + (pack.folder.flight || '') + ' (' + pack.folder.dep + ' → ' + pack.folder.arr + ', ' + pack.folderStations.length + ' aerodromes)'));
+    fd.appendChild(div({style: {fontSize: '11px', color: '#666', margin: '6px 0 8px'}}, 'Issued ' + (pack.folder.issued ? dpxFmtDZ(pack.folder.issued) : '?') + ', ETD ' + (pack.folder.etd ? dpxFmtDZ(pack.folder.etd) : '?') + (pack.findings.some(f => f.area === 'Pack' && f.sev === 'bad') ? ' - NOT the same flight as the plan above; shown for reference only.' : '')));
+    pack.folderStations.forEach(a => fd.appendChild(brfStationCard(a)));
+    main.appendChild(fd);
+  }
+
+  main.appendChild(btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '8px', padding: '11px 20px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', marginTop: '6px'}, onclick: dpxLogThisFlight}, 'Log this flight'));
+  main.appendChild(div({style: {fontSize: '10px', color: '#999', marginTop: '6px'}}, 'Pre-fills the date, airports, route, type and flight number from the documents. Times and hours are left for you to enter after the flight.'));
+}
+
+
 function render() {
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -2437,7 +3120,7 @@ function render() {
   header.appendChild(hi);
 
   const TABS_LIST = [
-    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
+    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'dispatch',label:'Dispatch'},{id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
     {id:'endorse',label:'Endorsements'},{id:'training',label:'Training'},
     {id:'recency',label:'Recency'},{id:'reports',label:'Reports'},{id:'docs',label:'Documents'},{id:'import',label:'Import'},
     {id:'profile',label:'Profile'},
@@ -2787,6 +3470,9 @@ function render() {
   }
   else if (state.tab === 'briefing') {
     brfRender(main);
+  }
+  else if (state.tab === 'dispatch') {
+    dpxRender(main);
   }
   else if (state.tab === 'recency') {
     const items = curItems();
