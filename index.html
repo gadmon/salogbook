@@ -3007,6 +3007,8 @@ async function dpxLoadFiles(fileList) {
 function dpxClear() {
   try { localStorage.removeItem(DPX_LS); } catch (e) {}
   dpxIdbDel('charts').catch(() => {});
+  // the pilot's confirmations belong to the pack - clearing the pack starts the next one with empty boxes
+  try { Object.keys(localStorage).filter(k => k.indexOf('salogbook_dpx_checks_') === 0).forEach(k => localStorage.removeItem(k)); } catch (e) {}
   state.dpx = null; render();
 }
 
