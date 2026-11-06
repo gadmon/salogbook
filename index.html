@@ -1938,16 +1938,19 @@ function curPickerCard() {
   card.appendChild(s);
 
   const det = el('details', {style:{marginTop:'10px'}});
+  det.open = !!state.curPickerOpen;   // keep the panel open across re-renders (ticking a rule re-renders the page)
+  det.addEventListener('toggle', () => { state.curPickerOpen = det.open; });
   det.appendChild(el('summary', {style:{cursor:'pointer', fontSize:'12px', color:'#0066CC'}}, 'Customise requirements'));
   const active = curActiveRuleIds(prefs);
   Object.entries(CUR_RULES).forEach(([id, r]) => {
-    const chk = el('input', {type:'checkbox', checked:active.includes(id), onchange:e => {
+    const chk = el('input', {type:'checkbox', onchange:e => {
       const base = CUR_PROFILES[prefs.profileId].rules.includes(id);
       let off = (prefs.off || []).filter(x => x !== id), on = (prefs.on || []).filter(x => x !== id);
       if (e.target.checked && !base) on.push(id);
       if (!e.target.checked && base) off.push(id);
       curSetPrefs({profileId:prefs.profileId, off, on});
     }});
+    chk.checked = active.includes(id);   // property, not attribute: el() would turn checked:false into checked="false" (still checked)
     det.appendChild(el('label', {style:{display:'flex', alignItems:'center', gap:'8px', fontSize:'12px', padding:'4px 0', color:'#333'}}, chk, r.label, el('span', {style:{color:'#999', fontSize:'10px', fontFamily:'monospace'}}, r.reg)));
   });
   card.appendChild(det);
@@ -1966,6 +1969,403 @@ function curBanner() {
   const txt = bad ? s.bad.length + ' requirement' + (s.bad.length > 1 ? 's' : '') + ' not current: ' + s.bad.slice(0, 3).map(i => i.label).join(', ')
                   : s.warn.length + ' expiring soon: ' + s.warn.slice(0, 3).map(i => i.label + ' (' + i.daysLeft + 'd)').join(', ');
   return div({style:{background:c.bg, color:c.fg, borderBottom:'1px solid '+c.bd, padding:'6px 14px', fontSize:'12px', fontWeight:'700', cursor:'pointer', textAlign:'center'}, onclick:() => setState({tab:'now'})}, txt);
+}
+
+
+// ─── BRIEFING ENGINE ─────────────────────────────────────────────────────────
+// Decodes raw METAR / TAF text and flags hazards DETERMINISTICALLY (no AI, no
+// network). The AI summary, when used, only re-words what is decoded here.
+//
+// This is a planning aid built on automatically-fetched reports. It is NOT an
+// official briefing: it does not see NOTAMs, SIGMETs, runway/closure data, or
+// local conditions, and many small aerodromes issue no METAR/TAF at all.
+
+const BRF_KT_PER_MPS = 1.94384;
+const BRF_SM_M = 1609.34;
+
+const BRF_WX_RE = /^(\+|-|VC)?(MI|PR|BC|DR|BL|SH|TS|FZ){0,2}(DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS){0,3}$/;
+
+function brfNewSnap() {
+  return {wind:null, vis_m:null, cavok:false, wx:[], clouds:[], ceiling_ft:null, noCloud:false};
+}
+
+// Parse one weather token into a snapshot; returns true if the token was understood.
+// `prev` is the previous token (needed for "1 1/2SM" style visibility).
+function brfApplyToken(snap, tok, prev) {
+  let m;
+  if ((m = tok.match(/^(VRB|\d{3})(\d{2,3})(?:G(\d{2,3}))?(KT|MPS|KMH)$/))) {
+    const f = m[4] === 'MPS' ? BRF_KT_PER_MPS : (m[4] === 'KMH' ? 0.539957 : 1);
+    snap.wind = {dir: m[1] === 'VRB' ? null : +m[1], spd: Math.round(+m[2] * f),
+                 gst: m[3] ? Math.round(+m[3] * f) : null, vrb: m[1] === 'VRB'};
+    return true;
+  }
+  if (tok === 'CAVOK') { snap.cavok = true; snap.vis_m = 9999; return true; }
+  if ((m = tok.match(/^(\d{4})$/))) { snap.vis_m = +m[1]; return true; }
+  if ((m = tok.match(/^(P|M)?(\d+)SM$/))) { snap.vis_m = Math.round((+m[2]) * BRF_SM_M) + (m[1] === 'P' ? 1 : 0); return true; }
+  if ((m = tok.match(/^(?:M)?(\d)\/(\d)SM$/))) {
+    const whole = prev && /^\d$/.test(prev) ? +prev : 0;
+    snap.vis_m = Math.round((whole + (+m[1]) / (+m[2])) * BRF_SM_M); return true;
+  }
+  if ((m = tok.match(/^(FEW|SCT|BKN|OVC)(\d{3})(CB|TCU)?$/))) {
+    snap.clouds.push({cover: m[1], base_ft: +m[2] * 100, type: m[3] || null}); return true;
+  }
+  if ((m = tok.match(/^VV(\d{3})$/))) { snap.clouds.push({cover:'VV', base_ft:+m[1] * 100, type:null}); return true; }
+  if (/^(NSC|NCD|SKC|CLR)$/.test(tok)) { snap.noCloud = true; return true; }
+  if (tok === 'NSW') return true;
+  if (tok.length >= 2 && BRF_WX_RE.test(tok) && !/^(M|P)$/.test(tok)) { snap.wx.push(tok); return true; }
+  return false;
+}
+
+function brfFinishSnap(snap) {
+  const layers = snap.clouds.filter(c => c.cover === 'BKN' || c.cover === 'OVC' || c.cover === 'VV');
+  snap.ceiling_ft = layers.length ? Math.min(...layers.map(c => c.base_ft)) : null;
+  return snap;
+}
+
+function brfParseTime(tok) { if (!tok) return null; const m = tok.match(/^(\d{2})(\d{2})(\d{2})Z$/); return m ? {day:+m[1], hour:+m[2], min:+m[3]} : null; }
+
+// Resolve a day/hour in a report to a real Date (UTC) near `now`.
+function brfResolve(day, hour, min, now) {
+  let y = now.getUTCFullYear(), mo = now.getUTCMonth();
+  if (day < now.getUTCDate() - 15) mo += 1;
+  else if (day > now.getUTCDate() + 15) mo -= 1;
+  return new Date(Date.UTC(y, mo, day, hour, min || 0));   // hour 24 rolls to next day automatically
+}
+
+// ---- METAR ------------------------------------------------------------------
+function brfParseMetar(raw, now) {
+  if (!raw) return null;
+  now = now || new Date();
+  const out = {raw: raw.trim(), station:null, time:null, obsTime:null, temp:null, dew:null, qnh_hpa:null, trends:[], ...brfNewSnap()};
+  const body = out.raw.split(/\bRMK\b/)[0].trim();
+  const toks = body.split(/\s+/);
+  let i = 0;
+  if (toks[i] === 'METAR' || toks[i] === 'SPECI') i++;
+  if (/^[A-Z]{4}$/.test(toks[i])) out.station = toks[i++];
+  if (toks[i] === 'COR' || toks[i] === 'AUTO') i++;
+  const t = brfParseTime(toks[i]); if (t) { out.time = t; out.obsTime = brfResolve(t.day, t.hour, t.min, now); i++; }
+  let prev = '', trend = null;
+  for (; i < toks.length; i++) {
+    const tok = toks[i];
+    if (tok === 'AUTO' || tok === 'COR') { prev = tok; continue; }
+    if (tok === 'NOSIG') { trend = null; prev = tok; continue; }
+    if (tok === 'BECMG' || tok === 'TEMPO') { trend = {kind: tok, ...brfNewSnap()}; out.trends.push(trend); prev = tok; continue; }
+    if (/^(FM|TL|AT)\d{4}$/.test(tok)) { prev = tok; continue; }
+    let m;
+    if (!trend && (m = tok.match(/^(M?\d{2})\/(M?\d{2})?$/))) {
+      const n = s => s ? (s[0] === 'M' ? -1 : 1) * +s.replace('M','') : null;
+      out.temp = n(m[1]); out.dew = n(m[2]); prev = tok; continue;
+    }
+    if ((m = tok.match(/^Q(\d{4})$/))) { out.qnh_hpa = +m[1]; prev = tok; continue; }
+    if ((m = tok.match(/^A(\d{4})$/))) { out.qnh_hpa = Math.round(+m[1] / 100 * 33.8639); prev = tok; continue; }
+    brfApplyToken(trend || out, tok, prev);
+    prev = tok;
+  }
+  brfFinishSnap(out); out.trends.forEach(brfFinishSnap);
+  return out;
+}
+
+// ---- TAF --------------------------------------------------------------------
+function brfParseTaf(raw, now) {
+  if (!raw || /\bNIL\b/.test(raw)) return null;
+  now = now || new Date();
+  const out = {raw: raw.trim(), station:null, issued:null, from:null, to:null, periods:[]};
+  const toks = out.raw.split(/\s+/);
+  let i = 0;
+  if (toks[i] === 'TAF') i++;
+  if (toks[i] === 'AMD' || toks[i] === 'COR') i++;
+  if (/^[A-Z]{4}$/.test(toks[i])) out.station = toks[i++];
+  const it = brfParseTime(toks[i]); if (it) { out.issued = brfResolve(it.day, it.hour, it.min, now); i++; }
+  let m = (toks[i] || '').match(/^(\d{2})(\d{2})\/(\d{2})(\d{2})$/);
+  if (m) { out.from = brfResolve(+m[1], +m[2], 0, now); out.to = brfResolve(+m[3], +m[4], 0, now); i++; }
+  let cur = {kind:'BASE', from:out.from, to:out.to, prob:null, ...brfNewSnap()};
+  out.periods.push(cur);
+  let prev = '', prob = null;
+  for (; i < toks.length; i++) {
+    const tok = toks[i];
+    if ((m = tok.match(/^PROB(\d{2})$/))) { prob = +m[1]; prev = tok; continue; }
+    if ((m = tok.match(/^FM(\d{2})(\d{2})(\d{2})$/))) {
+      cur = {kind:'FM', from:brfResolve(+m[1], +m[2], +m[3], now), to:out.to, prob:null, ...brfNewSnap()}; out.periods.push(cur); prob = null; prev = tok; continue;
+    }
+    if (tok === 'BECMG' || tok === 'TEMPO') {
+      const w = (toks[i + 1] || '').match(/^(\d{2})(\d{2})\/(\d{2})(\d{2})$/);
+      cur = {kind:tok, from:null, to:null, prob, ...brfNewSnap()};
+      if (w) { cur.from = brfResolve(+w[1], +w[2], 0, now); cur.to = brfResolve(+w[3], +w[4], 0, now); i++; }
+      out.periods.push(cur); prob = null; prev = tok; continue;
+    }
+    if (prob !== null && (m = tok.match(/^(\d{2})(\d{2})\/(\d{2})(\d{2})$/))) {   // PROB30 0612/0618 (no TEMPO)
+      cur = {kind:'PROB', from:brfResolve(+m[1], +m[2], 0, now), to:brfResolve(+m[3], +m[4], 0, now), prob, ...brfNewSnap()};
+      out.periods.push(cur); prob = null; prev = tok; continue;
+    }
+    if (/^(TX|TN)M?\d{2}\/\d{4}Z$/.test(tok) || tok === 'CNL') { prev = tok; continue; }
+    brfApplyToken(cur, tok, prev); prev = tok;
+  }
+  out.periods.forEach(brfFinishSnap);
+  return out;
+}
+
+// ---- derived values -----------------------------------------------------------
+// FAA-style categories, with visibility in metres.
+function brfCategory(vis_m, ceiling_ft) {
+  const v = vis_m == null ? 9999 : vis_m, c = ceiling_ft == null ? 99999 : ceiling_ft;
+  if (v < 1609 || c < 500) return 'LIFR';
+  if (v < 4828 || c < 1000) return 'IFR';
+  if (v < 8047 || c <= 3000) return 'MVFR';
+  return 'VFR';
+}
+const BRF_CAT_RANK = {VFR:0, MVFR:1, IFR:2, LIFR:3};
+
+function brfDensityAlt(elevM, tempC, qnh) {
+  if (elevM == null || tempC == null || qnh == null) return null;
+  const elevFt = elevM * 3.28084;
+  const pa = elevFt + (1013.25 - qnh) * 27;
+  const isa = 15 - 1.98 * pa / 1000;
+  return {elevFt: Math.round(elevFt), da: Math.round(pa + 118.8 * (tempC - isa))};
+}
+
+const brfFmtVis = v => v == null ? '-' : (v >= 9999 ? '10 km+' : (v >= 5000 ? (v / 1000).toFixed(0) + ' km' : v + ' m'));
+const brfFmtWind = w => !w ? '-' : (w.spd === 0 ? 'calm' : (w.vrb ? 'VRB' : String(w.dir).padStart(3, '0') + '°') + ' ' + w.spd + ' kt' + (w.gst ? ' G' + w.gst : ''));
+const brfFmtClouds = s => s.cavok ? 'CAVOK' : (s.clouds.length ? s.clouds.map(c => c.cover + ' ' + c.base_ft + (c.type ? ' ' + c.type : '')).join(', ') : (s.noCloud ? 'no significant cloud' : '-'));
+const brfHHMM = d => d ? String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCHours()).padStart(2, '0') + String(d.getUTCMinutes()).padStart(2, '0') + 'Z' : '';
+
+// ---- hazard flags -----------------------------------------------------------
+// sev: 'bad' (do not proceed without a plan) | 'warn' (take care) | 'info'
+function brfSnapFlags(s, rules, label, extra) {
+  const f = [];
+  const add = (sev, text) => f.push({sev, text, when: label});
+  const cat = brfCategory(s.vis_m, s.ceiling_ft);
+  const desc = 'vis ' + brfFmtVis(s.vis_m) + ', ceiling ' + (s.ceiling_ft != null ? s.ceiling_ft + ' ft' : 'none');
+  if (rules === 'VFR') {
+    if (cat === 'IFR' || cat === 'LIFR') add('bad', 'Below VFR minima (' + cat + '): ' + desc);
+    else if (cat === 'MVFR') add('warn', 'Marginal VFR (MVFR): ' + desc);
+  } else if (cat === 'LIFR') add('warn', 'Very low vis/ceiling (LIFR): ' + desc + ' - check approach minima and alternate');
+  if (s.wx.some(w => /TS/.test(w))) add('bad', 'Thunderstorms reported/forecast');
+  else if (s.clouds.some(c => c.type)) add('warn', 'Towering cumulus/cumulonimbus (' + s.clouds.filter(c => c.type).map(c => c.type + ' ' + c.base_ft + ' ft').join(', ') + ')');
+  if (s.wx.some(w => /FZ/.test(w))) add('bad', 'Freezing fog/precipitation');
+  if (s.wx.some(w => /(SQ|FC|VA|DS|SS)$/.test(w))) add('bad', 'Severe weather phenomenon: ' + s.wx.filter(w => /(SQ|FC|VA|DS|SS)$/.test(w)).join(' '));
+  if (s.wx.some(w => /^\+(.*)(RA|SN|GR|GS)/.test(w))) add('warn', 'Heavy precipitation: ' + s.wx.filter(w => w[0] === '+').join(' '));
+  if (s.wx.some(w => /FG/.test(w)) && !s.wx.some(w => /FZ/.test(w))) add('warn', 'Fog reported/forecast');
+  if (s.wind) {
+    const peak = Math.max(s.wind.spd, s.wind.gst || 0);
+    if ((s.wind.gst || 0) >= 35) add('bad', 'Strong gusts: ' + brfFmtWind(s.wind));
+    else if (peak >= 25) add('warn', 'Strong wind: ' + brfFmtWind(s.wind));
+    else if (s.wind.gst && s.wind.gst - s.wind.spd >= 15) add('warn', 'Gusty, likely turbulence: ' + brfFmtWind(s.wind));
+  }
+  if (extra && extra.fogRisk && s.temp != null && s.dew != null && s.temp - s.dew <= 2) add('warn', 'Fog/low-cloud risk: temperature and dew point only ' + (s.temp - s.dew) + '°C apart');
+  return f;
+}
+
+// Combine the current METAR and the TAF periods in the next `horizonH` hours.
+function brfAnalyse(data, opts) {
+  opts = opts || {};
+  const now = opts.now || new Date(), rules = opts.rules || 'VFR', horizon = (opts.horizonH || 12) * 3600000;
+  const metar = brfParseMetar(data.metarRaw, now), taf = brfParseTaf(data.tafRaw, now);
+  const flags = [];
+  if (!metar) flags.push({sev:'warn', text:'No METAR available - this aerodrome may not report weather. Use the nearest reporting aerodrome or the SA Weather Service.', when:'now'});
+  else {
+    const ageMin = Math.round((now - metar.obsTime) / 60000);
+    if (ageMin > 90) flags.push({sev:'warn', text:'METAR is ' + ageMin + ' minutes old - may no longer be representative', when:'now'});
+    flags.push(...brfSnapFlags({...metar}, rules, 'now', {fogRisk:true}));
+    const da = brfDensityAlt(data.elevM, metar.temp, metar.qnh_hpa);
+    if (da) {
+      const d = da.da - da.elevFt;
+      flags.push({sev: d >= 2500 ? 'warn' : 'info', text:'Density altitude ' + da.da + ' ft (aerodrome ' + da.elevFt + ' ft)' + (d >= 2500 ? ' - performance noticeably reduced' : ''), when:'now'});
+    }
+    metar.trends.forEach(tr => flags.push(...brfSnapFlags(tr, rules, tr.kind + ' (METAR trend)')));
+  }
+  if (!taf) flags.push({sev:'info', text:'No TAF available - no forecast to rely on for this aerodrome.', when:'forecast'});
+  else {
+    taf.periods.forEach(p => {
+      const end = p.to || taf.to, start = p.from || taf.from;
+      if (end && end < now) return;
+      if (start && start - now > horizon) return;
+      const label = (p.kind === 'BASE' ? 'TAF' : p.kind + (p.prob ? ' PROB' + p.prob : '')) + ' ' + brfHHMM(start) + '-' + brfHHMM(end);
+      const sub = brfSnapFlags(p.kind === 'BASE' || p.kind === 'FM' || p.kind === 'BECMG' ? p : p, rules, label);
+      // Periods inherit nothing from the base group in this simple decoder, so only
+      // flag what the period itself states - an omitted element means "no change".
+      flags.push(...sub);
+    });
+  }
+  // merge identical hazards across periods
+  const merged = [];
+  flags.forEach(f => {
+    const ex = merged.find(m => m.sev === f.sev && m.text === f.text);
+    if (ex) ex.when += '; ' + f.when; else merged.push({...f});
+  });
+  const rank = {bad:0, warn:1, info:2};
+  merged.sort((a, b) => rank[a.sev] - rank[b.sev]);
+  return {
+    icao: data.icao, role: data.role, metar, taf, flags: merged,
+    category: metar ? brfCategory(metar.vis_m, metar.ceiling_ft) : null,
+    worst: merged.some(f => f.sev === 'bad') ? 'bad' : (merged.some(f => f.sev === 'warn') ? 'warn' : 'ok'),
+  };
+}
+
+function brfMetarLine(m) {
+  if (!m) return 'No METAR';
+  return 'Wind ' + brfFmtWind(m.wind) + ' - Vis ' + brfFmtVis(m.vis_m) + (m.wx.length ? ' - ' + m.wx.join(' ') : '') +
+         ' - ' + brfFmtClouds(m) + (m.temp != null ? ' - ' + m.temp + '/' + (m.dew != null ? m.dew : '?') + '°C' : '') +
+         (m.qnh_hpa ? ' - QNH ' + m.qnh_hpa : '');
+}
+
+
+// ─── BRIEFING UI ─────────────────────────────────────────────────────────────
+const BRF_COL = {
+  bad:  {bg:'#FFEBEE', fg:'#C62828', bd:'#FFCDD2'},
+  warn: {bg:'#FFF8E1', fg:'#B26A00', bd:'#FFE082'},
+  ok:   {bg:'#E8F5E9', fg:'#2E7D32', bd:'#A5D6A7'},
+  info: {bg:'#E8F0F8', fg:'#1F4E79', bd:'#BBD3EA'},
+};
+const BRF_CAT_COL = {VFR:'ok', MVFR:'info', IFR:'warn', LIFR:'bad'};
+
+function brfState() {
+  if (!state.brf) {
+    const last = (state.flights || [])[0] || {};
+    const ok = s => /^[A-Z]{4}$/.test(s || '') ? s : '';
+    let recent = [];
+    try { recent = JSON.parse(localStorage.getItem('salogbook_brf_recent') || '[]'); } catch (e) {}
+    state.brf = {dep: ok(last.dep_airport), dest: ok(last.arr_airport), alt: '', rules: 'VFR',
+                 loading: false, error: '', raw: null, fetchedAt: null, ai: {loading:false, text:'', error:''}, recent};
+  }
+  return state.brf;
+}
+
+function brfFriendlyError(err) {
+  const msg = (err && (err.message || String(err))) || 'Unknown error';
+  if (/not found|404|Failed to send a request|FunctionsFetchError|NetworkError|Failed to fetch/i.test(msg)) {
+    return 'The briefing service is not reachable. It needs the "brief-route" Supabase function to be deployed (see brief-route.ts in the repository), and an internet connection.';
+  }
+  return msg;
+}
+
+async function brfFetch() {
+  const b = brfState();
+  const stations = [['Departure', b.dep], ['Destination', b.dest], ['Alternate', b.alt]]
+    .filter(([, c]) => c).map(([role, icao]) => ({role, icao: icao.toUpperCase()}));
+  if (!stations.length) { b.error = 'Enter at least one airport (4-letter ICAO code, e.g. FAOR).'; render(); return; }
+  const bad = stations.find(s => !/^[A-Z]{4}$/.test(s.icao));
+  if (bad) { b.error = '"' + bad.icao + '" is not a 4-letter ICAO code (e.g. FAOR, FACT, FALA).'; render(); return; }
+  if (!isOnline) { b.error = 'You are offline. Briefings need an internet connection.'; render(); return; }
+  Object.assign(b, {loading:true, error:'', raw:null, ai:{loading:false, text:'', error:''}});
+  render();
+  try {
+    const { data, error } = await sb.functions.invoke('brief-route', {body:{stations: stations.map(s => s.icao)}});
+    if (error) throw error;
+    if (data && data.error) throw new Error(data.error.message);
+    b.raw = {stations, data: data.stations || {}, upstream: data.upstream || null};
+    b.fetchedAt = data.fetchedAt || new Date().toISOString();
+    const route = {dep:b.dep, dest:b.dest, alt:b.alt};
+    b.recent = [route, ...b.recent.filter(r => !(r.dep === route.dep && r.dest === route.dest && r.alt === route.alt))].slice(0, 5);
+    try { localStorage.setItem('salogbook_brf_recent', JSON.stringify(b.recent)); } catch (e) {}
+  } catch (e) {
+    b.error = brfFriendlyError(e);
+  }
+  b.loading = false;
+  render();
+}
+
+// Analyse on every render so switching VFR/IFR re-evaluates without a new fetch.
+function brfAnalyses() {
+  const b = brfState();
+  if (!b.raw) return [];
+  const now = new Date();
+  return b.raw.stations.map(s => brfAnalyse({icao:s.icao, role:s.role, ...(b.raw.data[s.icao] || {})}, {rules:b.rules, now}));
+}
+
+function brfAiPrompt(analyses, rules) {
+  return 'Flight rules: ' + rules + '\n\n' + analyses.map(a =>
+    '### ' + a.role + ' ' + a.icao + '\nMETAR: ' + (a.metar ? a.metar.raw : 'none') + '\nTAF: ' + (a.taf ? a.taf.raw : 'none') +
+    '\nDetected flags:\n' + (a.flags.length ? a.flags.map(f => '- [' + f.sev + '] ' + f.text + ' (' + f.when + ')').join('\n') : '- none')
+  ).join('\n\n');
+}
+
+async function brfExplain() {
+  const b = brfState();
+  const analyses = brfAnalyses();
+  if (!analyses.length) return;
+  b.ai = {loading:true, text:'', error:''};
+  render();
+  try {
+    const { data, error } = await sb.functions.invoke('brief-route', {body:{mode:'explain', prompt: brfAiPrompt(analyses, b.rules)}});
+    if (error) throw error;
+    if (data && data.error) throw new Error(data.error.message);
+    b.ai = {loading:false, text: data.text || '', error:''};
+  } catch (e) {
+    b.ai = {loading:false, text:'', error: brfFriendlyError(e)};
+  }
+  render();
+}
+
+function brfChip(txt, kind) {
+  const c = BRF_COL[kind];
+  return el('span', {style:{background:c.bg, color:c.fg, border:'1px solid '+c.bd, borderRadius:'4px', padding:'2px 9px', fontSize:'11px', fontWeight:'700', whiteSpace:'nowrap'}}, txt);
+}
+
+function brfStationCard(a) {
+  const c = BRF_COL[a.worst];
+  const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderLeft:'5px solid '+c.fg, borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}});
+  card.appendChild(div({style:{display:'flex', justifyContent:'space-between', alignItems:'center', gap:'8px', flexWrap:'wrap'}},
+    div({}, el('span', {style:{fontWeight:'800', fontSize:'16px', fontFamily:'monospace'}}, a.icao), el('span', {style:{fontSize:'11px', color:'#888', marginLeft:'8px'}}, a.role)),
+    div({style:{display:'flex', gap:'6px'}}, a.category ? brfChip(a.category, BRF_CAT_COL[a.category]) : null,
+      brfChip(a.worst === 'bad' ? 'HAZARDS' : (a.worst === 'warn' ? 'CAUTION' : 'NO FLAGS'), a.worst))
+  ));
+  card.appendChild(div({style:{fontFamily:'monospace', fontSize:'12px', color:'#333', margin:'8px 0', lineHeight:'1.6'}}, brfMetarLine(a.metar)));
+  a.flags.forEach(f => {
+    const fc = BRF_COL[f.sev];
+    card.appendChild(div({style:{background:fc.bg, border:'1px solid '+fc.bd, color:fc.fg, borderRadius:'6px', padding:'6px 10px', fontSize:'12px', marginBottom:'5px', lineHeight:'1.5'}},
+      el('b', {}, f.text), el('span', {style:{opacity:.8, marginLeft:'6px', fontSize:'11px'}}, '(' + f.when + ')')));
+  });
+  const det = el('details', {style:{marginTop:'8px'}}, el('summary', {style:{cursor:'pointer', fontSize:'11px', color:'#0066CC'}}, 'Raw reports'));
+  det.appendChild(el('pre', {style:{whiteSpace:'pre-wrap', fontSize:'11px', color:'#444', background:'#F8F9FA', padding:'8px', borderRadius:'6px', margin:'6px 0 0'}},
+    'METAR: ' + (a.metar ? a.metar.raw : 'none') + '\n\nTAF: ' + (a.taf ? a.taf.raw : 'none')));
+  card.appendChild(det);
+  return card;
+}
+
+function brfRender(main) {
+  const b = brfState();
+  main.appendChild(div({style:{marginBottom:'12px'}},
+    el('h2', {style:{margin:'0 0 4px', fontSize:'18px', color:'#1A1A1A'}}, 'Route briefing'),
+    el('p', {style:{color:'#555', fontSize:'12px', margin:0}}, 'Latest METAR and TAF for your route, with hazards flagged. Planning aid only.')));
+
+  const si = {width:'100%', background:'#fff', border:'1px solid #CED4DA', borderRadius:'6px', padding:'8px 10px', fontSize:'14px', fontFamily:'monospace', textTransform:'uppercase', outline:'none'};
+  const field = (label, key, ph) => div({style:{flex:'1', minWidth:'90px'}}, el('label', {style:{display:'block', fontSize:'10px', color:'#666', marginBottom:'3px', textTransform:'uppercase', letterSpacing:'.06em'}}, label),
+    (() => { const i = inp({type:'text', value:b[key], placeholder:ph, maxlength:'4', style:si, oninput:e => { b[key] = e.target.value.toUpperCase().replace(/[^A-Z]/g, ''); e.target.value = b[key]; }});
+      i.addEventListener('keydown', e => { if (e.key === 'Enter') brfFetch(); }); return i; })());
+  const form = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}});
+  form.appendChild(div({style:{display:'flex', gap:'10px', flexWrap:'wrap'}}, field('Departure', 'dep', 'FAOR'), field('Destination', 'dest', 'FACT'), field('Alternate', 'alt', 'optional')));
+  const rulesSel = sel({style:{background:'#fff', border:'1px solid #CED4DA', borderRadius:'6px', padding:'8px 10px', fontSize:'13px', cursor:'pointer'},
+    onchange:e => { b.rules = e.target.value; render(); }});
+  [['VFR', 'VFR flight'], ['IFR', 'IFR flight']].forEach(([v, t]) => rulesSel.appendChild(opt(v, t, b.rules === v)));
+  form.appendChild(div({style:{display:'flex', gap:'10px', alignItems:'center', marginTop:'12px', flexWrap:'wrap'}}, rulesSel,
+    btn({style:{width:'auto', background:'#006B3F', color:'#FFB612', border:'none', borderRadius:'8px', padding:'9px 18px', fontSize:'13px', fontWeight:'700', cursor:b.loading ? 'default' : 'pointer', opacity:b.loading ? '.5' : '1'}, ...(b.loading ? {disabled:true} : {}), onclick:brfFetch}, b.loading ? 'Fetching...' : 'Get briefing')));
+  if (b.recent.length) {
+    const rc = div({style:{display:'flex', gap:'6px', flexWrap:'wrap', marginTop:'10px'}}, el('span', {style:{fontSize:'11px', color:'#888', alignSelf:'center'}}, 'Recent:'));
+    b.recent.forEach(r => rc.appendChild(btn({style:{background:'#F1F3F5', border:'1px solid #DEE2E6', borderRadius:'14px', padding:'3px 10px', fontSize:'11px', fontFamily:'monospace', cursor:'pointer'},
+      onclick:() => { Object.assign(b, {dep:r.dep, dest:r.dest, alt:r.alt}); render(); }}, [r.dep, r.dest, r.alt].filter(Boolean).join(' > '))));
+    form.appendChild(rc);
+  }
+  main.appendChild(form);
+
+  if (b.error) main.appendChild(div({style:{background:BRF_COL.bad.bg, border:'1px solid '+BRF_COL.bad.bd, color:BRF_COL.bad.fg, borderRadius:'8px', padding:'10px 14px', fontSize:'12px', marginBottom:'14px', lineHeight:'1.5'}}, b.error));
+  if (!b.raw) return;
+
+  const analyses = brfAnalyses();
+  const anyBad = analyses.some(a => a.worst === 'bad'), anyWarn = analyses.some(a => a.worst === 'warn');
+  const kind = anyBad ? 'bad' : (anyWarn ? 'warn' : 'ok'), k = BRF_COL[kind];
+  const nBad = analyses.reduce((n, a) => n + a.flags.filter(f => f.sev === 'bad').length, 0);
+  main.appendChild(div({style:{background:k.bg, border:'1px solid '+k.bd, borderLeft:'6px solid '+k.fg, borderRadius:'10px', padding:'14px 18px', marginBottom:'14px'}},
+    div({style:{fontSize:'18px', fontWeight:'800', color:k.fg}}, anyBad ? nBad + ' hazard' + (nBad > 1 ? 's' : '') + ' flagged on this route' : (anyWarn ? 'Take care - cautions on this route' : 'No hazards flagged')),
+    div({style:{fontSize:'11px', color:'#555', marginTop:'4px'}}, 'Fetched ' + new Date(b.fetchedAt).toLocaleTimeString('en-ZA', {hour:'2-digit', minute:'2-digit'}) + ' - ' + b.rules + ' rules. "No hazards flagged" is not a go decision: NOTAMs, SIGMETs and runway data are not included.')));
+  analyses.forEach(a => main.appendChild(brfStationCard(a)));
+
+  const ai = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderLeft:'5px solid #6F42C1', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}},
+    div({style:{fontWeight:'800', fontSize:'14px', marginBottom:'6px'}}, 'Plain-language summary (AI)'));
+  if (b.ai.text) ai.appendChild(div({style:{fontSize:'13px', color:'#222', lineHeight:'1.6', whiteSpace:'pre-wrap'}}, b.ai.text));
+  else ai.appendChild(btn({...(b.ai.loading ? {disabled:true} : {}), style:{width:'auto', border:'1px solid #6F42C1', color:'#6F42C1', background:'#fff', borderRadius:'7px', padding:'8px 14px', fontSize:'12px', cursor:'pointer'}, onclick:brfExplain}, b.ai.loading ? 'Summarising...' : 'Explain in plain language'));
+  if (b.ai.error) ai.appendChild(div({style:{color:BRF_COL.bad.fg, fontSize:'12px', marginTop:'8px'}}, b.ai.error));
+  ai.appendChild(div({style:{fontSize:'10px', color:'#999', marginTop:'8px'}}, 'AI re-words the decoded data above and can make mistakes. The flags above are produced by fixed rules, not AI.'));
+  main.appendChild(ai);
 }
 
 
@@ -2025,7 +2425,7 @@ function render() {
   header.appendChild(hi);
 
   const TABS_LIST = [
-    {id:'now',label:'Currency'},{id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
+    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
     {id:'endorse',label:'Endorsements'},{id:'training',label:'Training'},
     {id:'recency',label:'Recency'},{id:'reports',label:'Reports'},{id:'docs',label:'Documents'},{id:'import',label:'Import'},
     {id:'profile',label:'Profile'},
@@ -2372,6 +2772,9 @@ function render() {
     main.appendChild(listCard);
     const pt = curPerTypeCard(); if (pt) main.appendChild(pt);
     main.appendChild(btn({style:{background:'none',border:'1px solid #CED4DA',color:'#0066CC',borderRadius:'7px',padding:'8px 14px',fontSize:'12px',cursor:'pointer'},onclick:()=>setState({tab:'recency'})},'Change profile / details'));
+  }
+  else if (state.tab === 'briefing') {
+    brfRender(main);
   }
   else if (state.tab === 'recency') {
     const items = curItems();
