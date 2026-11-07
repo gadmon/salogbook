@@ -2912,7 +2912,14 @@ function dpxBuildPack(plan, folder, opts) {
     return {...n, sev: n.type === 'NOTAMC' ? 'info' : (sv ? sv[0] : 'info'), kind: sv ? sv[1] : 'Cancellation', note, bDate: b, cDate: c};
   });
   const nb = notams.filter(n => n.sev === 'bad').length, nw = notams.filter(n => n.sev === 'warn').length;
-  if (nb) F('bad', 'NOTAM', nb + ' NOTAM' + (nb > 1 ? 's' : '') + ' look like closures at aerodromes on your plan - read them.');
+  // one headline problem per closure NOTAM, so an en-route / alternate closure (e.g. a runway closed) is counted, not buried
+  notams.filter(n => n.sev === 'bad' && !n.note).forEach(n => {
+    const where = n.section || n.loc || 'aerodrome';
+    const st = plan.stations.find(x => x.icao === n.section);
+    const role = st && st.role ? ' (' + st.role + ')' : '';
+    F('bad', 'NOTAM', where + role + ' ' + n.id + ': ' + (n.title || n.kind || 'closure') + ' - ' + String(n.text || '').replace(/\s+/g, ' ').slice(0, 140) + (n.b || n.c ? ' [' + (n.b || '?') + ' to ' + (n.c || '?') + ']' : ''));
+  });
+  notams.filter(n => n.sev === 'bad' && n.note).forEach(n => F('info', 'NOTAM', (n.loc || n.section || '') + ' ' + n.id + ' looks like a closure but: ' + n.note.toLowerCase() + '.'));
   if (nw) F('warn', 'NOTAM', nw + ' NOTAM' + (nw > 1 ? 's' : '') + ' mention nav-aid / runway / fuel / airspace issues.');
   if (plan.notams.length) F('info', 'NOTAM', plan.notams.length + ' NOTAMs in the pack. Flags come from keyword matching - they help you find the important ones but do NOT replace reading all of them.');
 
@@ -3008,8 +3015,85 @@ function dpxClear() {
   try { localStorage.removeItem(DPX_LS); } catch (e) {}
   dpxIdbDel('charts').catch(() => {});
   // the pilot's confirmations belong to the pack - clearing the pack starts the next one with empty boxes
-  try { Object.keys(localStorage).filter(k => k.indexOf('salogbook_dpx_checks_') === 0).forEach(k => localStorage.removeItem(k)); } catch (e) {}
+  try { Object.keys(localStorage).filter(k => (k.indexOf('salogbook_dpx_checks_') === 0 || k.indexOf('salogbook_dpx_actual_') === 0)).forEach(k => localStorage.removeItem(k)); } catch (e) {}
   state.dpx = null; render();
+}
+
+// ---- After the flight: actual off/on blocks -> block time, night (SAA definition), counts ----
+function dpxActualKey(p) { return 'salogbook_dpx_actual_' + p.dep + p.arr + (p.etd ? p.etd.toISOString().slice(0, 13) : ''); }
+function dpxActualLoad(p) { try { return JSON.parse(localStorage.getItem(dpxActualKey(p)) || '{}'); } catch (e) { return {}; } }
+function dpxActualSet(p, k, v) { const a = dpxActualLoad(p); a[k] = v; try { localStorage.setItem(dpxActualKey(p), JSON.stringify(a)); } catch (e) {} render(); }
+function dpxHHMM(d) { return d ? String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0') : ''; }
+
+// Resolve HH:MM (UTC) entries to Dates on/after the planned ETD day; on-blocks rolls over midnight.
+function dpxActualTimes(p, a) {
+  const base = p.etd || p.eta; if (!base || !a.off || !a.on) return null;
+  const mk = (hm, day) => { const m = /^(\d{2}):(\d{2})$/.exec(hm); return m ? Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), +m[1], +m[2]) : null; };
+  let off = mk(a.off, base), on = mk(a.on, base);
+  if (off == null || on == null) return null;
+  // off-blocks within 12 h before the planned ETD clock means the previous day (late-night trips), else the same day
+  if (p.etd && off - p.etd.getTime() > 12 * 3600000) off -= 86400000;
+  if (p.etd && p.etd.getTime() - off > 12 * 3600000) off += 86400000;
+  if (on <= off) on += 86400000;
+  if (on - off > 24 * 3600000) return null;
+  return {off: new Date(off), on: new Date(on), blockH: (on - off) / 3600000};
+}
+// SAA night: sunset + 15 min to sunrise - 15 min, i.e. the sun's centre was below -0.833 deg at t-15 min AND at t+15 min.
+// Position is taken along the planned track if the pack has one, else the great circle between the two aerodromes.
+function dpxNightHours(p, off, on) {
+  const total = on - off; if (total <= 0) return null;
+  const tr = p.track && p.track.length > 1 ? p.track.filter(x => x.lat != null && x.lon != null && x.min != null) : [];
+  const dep = AIRPORT_COORDS[p.dep], arr = AIRPORT_COORDS[p.arr];
+  let posAt;
+  if (tr.length > 1) {
+    const last = tr[tr.length - 1].min || 1;
+    posAt = f => {
+      const m = Math.max(0, Math.min(1, f)) * last; let i = 1;
+      while (i < tr.length - 1 && tr[i].min < m) i++;
+      const a = tr[i - 1], b = tr[i], span = (b.min - a.min) || 1, u = Math.max(0, Math.min(1, (m - a.min) / span));
+      return [a.lat + (b.lat - a.lat) * u, a.lon + (b.lon - a.lon) * u];
+    };
+  } else if (dep && arr) {
+    const v0 = _llToVec(dep[0], dep[1]), v1 = _llToVec(arr[0], arr[1]);
+    const omega = Math.acos(Math.max(-1, Math.min(1, v0[0] * v1[0] + v0[1] * v1[1] + v0[2] * v1[2])));
+    posAt = f => _vecToLL(_slerp(v0, v1, omega, f));
+  } else return null;
+  const N = Math.min(240, Math.max(12, Math.round(total / 120000))); // about every 2 min
+  let n = 0;
+  for (let i = 0; i < N; i++) {
+    const f = (i + 0.5) / N, ms = off + f * total, ll = posAt(f);
+    if (solarElevationDeg(new Date(ms - 15 * 60000), ll[0], ll[1]) < -0.833 && solarElevationDeg(new Date(ms + 15 * 60000), ll[0], ll[1]) < -0.833) n++;
+  }
+  return Math.round((total / 3600000) * (n / N) * 10) / 10;
+}
+function dpxActualResult(p, a) {
+  const t = dpxActualTimes(p, a); if (!t) return null;
+  const night = dpxNightHours(p, t.off.getTime(), t.on.getTime());
+  const block = Math.round(t.blockH * 100) / 100;
+  // take-off / landing night-ness: same rule at the aerodrome, at the moment
+  const isNight = (ms, ic) => { const c = AIRPORT_COORDS[ic]; if (!c) return null; return solarElevationDeg(new Date(ms - 15 * 60000), c[0], c[1]) < -0.833 && solarElevationDeg(new Date(ms + 15 * 60000), c[0], c[1]) < -0.833; };
+  return {off: t.off, on: t.on, block, night, toNight: isNight(t.off.getTime(), p.dep), ldgNight: isNight(t.on.getTime(), p.arr)};
+}
+
+function dpxAfterFlightCard(pack) {
+  const p = pack.plan, a = dpxActualLoad(p), res = dpxActualResult(p, a);
+  const tin = (key, ph) => { const i = el('input', {type: 'time', style: {padding: '6px 8px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '13px'}}); i.value = a[key] || ''; i.addEventListener('change', () => dpxActualSet(p, key, i.value)); return i; };
+  const lab = (t, node) => div({style: {display: 'inline-block', marginRight: '14px', marginBottom: '6px', fontSize: '12px'}}, div({style: {fontWeight: '700', marginBottom: '3px'}}, t), node);
+  const kids = [
+    div({style: {fontWeight: '700', fontSize: '14px', marginBottom: '2px'}}, 'After the flight'),
+    div({style: {fontSize: '11px', color: '#666', marginBottom: '8px'}}, 'Enter the actual off-blocks and on-blocks in UTC. Planned: ' + (dpxHHMM(p.etd) || '?') + ' / ' + (dpxHHMM(p.eta) || '?') + 'Z.'),
+    lab('Off-blocks (Z)', tin('off')), lab('On-blocks (Z)', tin('on')),
+  ];
+  if (p.etd && !a.off && !a.on) kids.push(btn({style: {width: 'auto', background: '#fff', color: '#006B3F', border: '1px solid #006B3F', borderRadius: '6px', padding: '6px 10px', fontSize: '11px', cursor: 'pointer'}, onclick: () => { const x = dpxActualLoad(p); x.off = dpxHHMM(p.etd); x.on = dpxHHMM(p.eta); try { localStorage.setItem(dpxActualKey(p), JSON.stringify(x)); } catch (e) {} render(); }}, 'Use planned times'));
+  if (res) {
+    const to = a.to != null ? a.to : true, ld = a.ld != null ? a.ld : true;
+    kids.push(div({style: {fontFamily: 'monospace', fontSize: '13px', margin: '6px 0'}},
+      'Block ' + Math.floor(res.block) + 'h' + String(Math.round((res.block % 1) * 60)).padStart(2, '0') + ' (' + res.block.toFixed(2) + ' h)   Night ' + (res.night == null ? '?' : res.night.toFixed(1) + ' h')));
+    const chk = (key, val, text) => { const c = el('input', {type: 'checkbox'}); c.checked = !!val; c.addEventListener('change', () => dpxActualSet(p, key, c.checked)); return el('label', {style: {display: 'inline-block', marginRight: '14px', fontSize: '12px'}}, c, ' ' + text); };
+    kids.push(div({}, chk('to', to, 'I flew the take-off (' + (res.toNight == null ? 'day/night unknown' : res.toNight ? 'night' : 'day') + ')'), chk('ld', ld, 'I flew the landing (' + (res.ldgNight == null ? 'day/night unknown' : res.ldgNight ? 'night' : 'day') + ')')));
+    kids.push(div({style: {fontSize: '10px', color: '#888', marginTop: '4px'}}, 'Night = sunset +15 min to sunrise -15 min (SAA definition), worked out along the planned track. Check it against your own records before relying on it.'));
+  }
+  return dpxCard('ok', kids);
 }
 
 function dpxLogThisFlight() {
@@ -3025,6 +3109,15 @@ function dpxLogThisFlight() {
     relief_crew_name: '', sfi_sfe: 0, on_duty: '', off_duty: '', pilot_flying: false,
     check_captain_name: '', autolands: 0, catii: 0, catiii: 0, rnav_approaches: 0, ils_approaches: 0,
   };
+  const res = dpxActualResult(d.pack.plan, dpxActualLoad(d.pack.plan));
+  if (res) {
+    const a = dpxActualLoad(d.pack.plan), to = a.to != null ? a.to : true, ld = a.ld != null ? a.ld : true;
+    f.chocks_off = dpxHHMM(res.off); f.chocks_on = dpxHHMM(res.on); f.total_time = res.block;
+    if (res.night != null) f.night = res.night;
+    if (to) { if (res.toNight) f.night_takeoffs = 1; else f.day_takeoffs = 1; }
+    if (ld) { if (res.ldgNight) f.night_landings = 1; else f.day_landings = 1; }
+    f.remarks += ' | actual blocks ' + dpxHHMM(res.off) + '-' + dpxHHMM(res.on) + 'Z';
+  }
   setState({tab: 'log', showFlightForm: true, editFlight: f});
 }
 
@@ -3257,6 +3350,7 @@ function dpxRender(main) {
 
   main.appendChild(dpxPreDepartureCard(pack));
   main.appendChild(minCard(pack));
+  main.appendChild(dpxAfterFlightCard(pack));
 
   // parser warnings
   const pw = [...(p.warnings || []), ...((pack.folder && pack.folder.warnings) || [])];
@@ -3340,7 +3434,7 @@ function dpxRender(main) {
 
   main.appendChild(btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '8px', padding: '11px 20px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', marginTop: '6px'}, onclick: dpxLogThisFlight}, 'Log this flight'));
   main.appendChild(btn({style: {width: 'auto', background: '#fff', color: '#006B3F', border: '1px solid #006B3F', borderRadius: '8px', padding: '11px 20px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', marginTop: '6px', marginLeft: '8px'}, onclick: () => nbOpenFor(p.dep + '-' + p.arr + ' ' + (p.etd ? p.etd.toISOString().slice(0, 10) : ''))}, 'Add trip note'));
-  main.appendChild(div({style: {fontSize: '10px', color: '#999', marginTop: '6px'}}, 'Pre-fills the date, airports, route, type and flight number from the documents. Times and hours are left for you to enter after the flight.'));
+  main.appendChild(div({style: {fontSize: '10px', color: '#999', marginTop: '6px'}}, 'Pre-fills the date, airports, route, type and flight number from the documents. Enter your actual blocks above and the times, block time, night and landings are filled in too.'));
   const ov = dpxChartOverlay(d); if (ov) main.appendChild(ov);
 }
 
