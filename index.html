@@ -2110,6 +2110,7 @@ async function curToggleAlerts() {
 }
 // Once a day, when the app is opened: tell the pilot what has lapsed or is about to.
 function curNotifyOnOpen(force) {
+  pushSyncLapses();
   try {
     if (!state.session || !curAlertsOn() || curNeedsSetup()) return;
     const today = new Date().toISOString().slice(0, 10);
@@ -2124,6 +2125,56 @@ function curNotifyOnOpen(force) {
     new Notification('SALOGBOOK currency', {body: parts.slice(0, 5).join('; ') + (parts.length > 5 ? ' +' + (parts.length - 5) + ' more' : ''), tag: 'salogbook-currency'});
   } catch (e) { /* notifications are a convenience - never break the app */ }
 }
+// ---- Push alerts (works with the app closed) -----------------------------------------------------
+// The phone subscribes once; the app uploads the dates each requirement will lapse; a daily Supabase Edge
+// Function (send-currency-alerts) pushes a warning 14, 7 and 1 day before, and on the day. See push_alerts.sql.
+const PUSH_VAPID_PUBLIC = 'BL_ITDYpi-fitGKB0CjgDgcntd7J4EAbmiD-Os6rwbG9M6DkX94mcQdKWNHTBvKLr3_H0mZ1K81HzIKv6I1JGRI';
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && typeof Notification !== 'undefined';
+const pushOn = () => { try { return localStorage.getItem('salogbook_push_on') === '1' && pushSupported() && Notification.permission === 'granted'; } catch (e) { return false; } };
+const pushKey = () => { const p = '='.repeat((4 - PUSH_VAPID_PUBLIC.length % 4) % 4), b = (PUSH_VAPID_PUBLIC + p).replace(/-/g, '+').replace(/_/g, '/'); return Uint8Array.from(atob(b), c => c.charCodeAt(0)); };
+const pushIsIos = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const pushStandalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+async function pushEnable() {
+  try {
+    if (!pushSupported()) {
+      alert(pushIsIos() && !pushStandalone() ? 'On iPhone, push alerts only work once SALOGBOOK is added to your Home Screen: tap Share, then Add to Home Screen, then open it from the new icon and try again.' : 'This browser does not support push alerts. Use the calendar reminders instead.');
+      return;
+    }
+    const perm = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission();
+    if (perm !== 'granted') { toast('Notifications were not allowed - enable them in your phone settings for SALOGBOOK.'); return; }
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: pushKey()});
+    const j = sub.toJSON();
+    const {error} = await sb.from('push_subscriptions').upsert({user_id: state.session.user.id, endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth}, {onConflict: 'endpoint'});
+    if (error) throw error;
+    try { localStorage.setItem('salogbook_push_on', '1'); } catch (e) {}
+    await pushSyncLapses(true);
+    toast('Push alerts are on for this phone.');
+  } catch (e) { alert('Could not turn on push alerts: ' + (e.message || e) + '\n\nIf this keeps happening the push setup (push_alerts.sql) has not been run in Supabase yet.'); }
+  render();
+}
+async function pushDisable() {
+  try {
+    const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+    if (sub) { await sb.from('push_subscriptions').delete().eq('endpoint', sub.endpoint); await sub.unsubscribe(); }
+    await sb.from('currency_lapses').delete().eq('user_id', state.session.user.id);
+  } catch (e) { /* best effort */ }
+  try { localStorage.setItem('salogbook_push_on', '0'); sessionStorage.removeItem('salogbook_push_synced'); } catch (e) {}
+  render();
+}
+// Upload the lapse dates (only when they changed). Called whenever the logbook data has been loaded.
+async function pushSyncLapses(force) {
+  try {
+    if (!state.session || !pushOn() || curNeedsSetup() || !navigator.onLine) return;
+    const rows = curLapses().filter(i => i.daysLeft >= 0).map(i => ({user_id: state.session.user.id, rule_id: i.id, label: i.label, lapse_date: i.lapse.toISOString().slice(0, 10)}));
+    const sig = JSON.stringify(rows.map(r => [r.rule_id, r.lapse_date]));
+    if (!force && sessionStorage.getItem('salogbook_push_synced') === sig) return;
+    const del = await sb.from('currency_lapses').delete().eq('user_id', state.session.user.id); if (del.error) throw del.error;
+    if (rows.length) { const ins = await sb.from('currency_lapses').insert(rows); if (ins.error) throw ins.error; }
+    sessionStorage.setItem('salogbook_push_synced', sig);
+  } catch (e) { /* push is a convenience - never break the app */ }
+}
 function curAlertsCard() {
   const items = curLapses().filter(i => i.daysLeft >= 0);
   const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}});
@@ -2134,8 +2185,10 @@ function curAlertsCard() {
   const row = div({style:{display:'flex', gap:'8px', flexWrap:'wrap', marginTop:'10px'}});
   const bs = {width:'auto', background:'#fff', color:'#006B3F', border:'1px solid #006B3F', borderRadius:'7px', padding:'8px 12px', fontSize:'12px', fontWeight:'700', cursor:'pointer'};
   row.appendChild(btn({style:bs, onclick:curDownloadIcs}, 'Add reminders to my calendar (.ics)'));
+  row.appendChild(btn({style:bs, onclick:pushOn() ? pushDisable : pushEnable}, pushOn() ? 'Turn off push alerts' : 'Push alerts to my phone'));
   row.appendChild(btn({style:bs, onclick:curToggleAlerts}, curAlertsOn() ? 'Turn off alerts on this device' : 'Alert me on this device'));
   card.appendChild(row);
+  card.appendChild(div({style:{fontSize:'11px', color: pushOn() ? '#006B3F' : '#666', marginTop:'8px', lineHeight:'1.5'}}, pushOn() ? 'Push alerts are on: you will be warned 14, 7 and 1 day before a requirement lapses, and on the day - even when the app is closed.' : (pushIsIos() && !pushStandalone() ? 'Push alerts on iPhone need SALOGBOOK added to your Home Screen first (Share, then Add to Home Screen).' : 'Push alerts warn you 14, 7 and 1 day before a requirement lapses, even when the app is closed.')));
   card.appendChild(div({style:{fontSize:'10px', color:'#999', marginTop:'8px', lineHeight:'1.5'}}, 'The calendar file sets reminders 30, 7 and 1 day before each lapse date (works with Google, Apple and Outlook calendars). Device alerts appear once a day when you open the app - they cannot wake your phone while it is closed. Passenger and landing currency moves as you fly, so re-download the calendar file after logging flights.'));
   return card;
 }
