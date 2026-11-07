@@ -1,5 +1,5 @@
 // SALOGBOOK Service Worker v4
-const CACHE_NAME = 'salogbook-v17';
+const CACHE_NAME = 'salogbook-v18';
 
 // External libraries the app has a hard dependency on just to boot (Supabase JS
 // creates the client at the top of index.html's script - if it fails to load,
@@ -82,4 +82,21 @@ self.addEventListener('fetch', event => {
       });
     })
   );
+});
+
+// Push alerts: the server (send-currency-alerts) sends {title, body, tag}; show it, and open the app when tapped.
+self.addEventListener('push', event => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) { d = {body: event.data ? event.data.text() : ''}; }
+  event.waitUntil(self.registration.showNotification(d.title || 'SALOGBOOK currency', {
+    body: d.body || 'A currency requirement is about to lapse.', tag: d.tag || 'salogbook-currency', icon: d.icon, data: {url: d.url || '/salogbook/'},
+  }));
+});
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  const url = (event.notification.data && event.notification.data.url) || '/salogbook/';
+  event.waitUntil(self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(list => {
+    for (const c of list) { if ('focus' in c) return c.focus(); }
+    return self.clients.openWindow(url);
+  }));
 });
