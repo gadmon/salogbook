@@ -4490,9 +4490,131 @@ function nbNoteCard(row) {
   }
   if (!editing) card.appendChild(div({style: {display: 'flex', gap: '12px', marginTop: '8px'}},
     btn({style: {width: 'auto', background: 'none', border: 'none', color: '#0066CC', fontSize: '11px', cursor: 'pointer', padding: 0}, onclick: () => { nb.editId = row.id; render(); }}, 'Edit'),
+    btn({style: {width: 'auto', background: 'none', border: 'none', color: '#006B3F', fontSize: '11px', cursor: 'pointer', padding: 0, fontWeight: '700'}, onclick: () => shareOpen({note: row})}, 'Share'),
     btn({style: {width: 'auto', background: 'none', border: 'none', color: '#C62828', fontSize: '11px', cursor: 'pointer', padding: 0}, onclick: () => nbDelete(row)}, 'Delete')));
   return card;
 }
+// ================= SHARE CARD =========================================================
+// Builds a picture card on the pilot's own device and hands it to the phone's share sheet (or downloads it).
+// Nothing is uploaded or posted by the app. Only the items the pilot ticks go on the card.
+const SHARE_DEFAULTS = {route: true, date: true, type: true, hours: true, night: false, landings: false, reg: false, fno: false, note: true};
+function shareOpen(src) {
+  const nb = state.nb;
+  let flight = src.flight || null, note = src.note || null;
+  if (note && !flight && note.flight_id) flight = state.flights.find(f => String(f.id) === String(note.flight_id)) || null;
+  const photos = [];
+  const addFrom = n => (n.photos || []).forEach(p => { if (!photos.find(x => x.path === p.path)) photos.push({path: p.path, on: !!note}); });
+  if (note) addFrom(note);
+  else if (flight && nb && nb.rows) nb.rows.filter(n => String(n.flight_id) === String(flight.id)).forEach(addFrom);
+  state.share = {flight, note, opts: {...SHARE_DEFAULTS}, caption: note ? (note.body || '') : '', photos, canvasUrl: null, busy: false, msg: ''};
+  shareRedraw();
+}
+function shareClose() { state.share = null; render(); }
+
+function shareLines(sh) {
+  const f = sh.flight, o = sh.opts, ft = f ? (f.total_time || 0) + (f.sim_time || 0) : 0;
+  const title = f && o.route && f.dep_airport ? f.dep_airport + (f.arr_airport ? '  →  ' + f.arr_airport : '') : (sh.note && sh.note.trip ? sh.note.trip.replace(/\s*\d{4}-\d{2}-\d{2}\s*$/, '') : 'Flight');
+  const chips = [];
+  if (f) {
+    if (o.date && f.date) chips.push(fmtDate(f.date));
+    if (o.type && f.aircraft_type) chips.push(f.aircraft_type);
+    if (o.reg && f.aircraft_reg) chips.push(f.aircraft_reg);
+    if (o.fno && f.flight_number) chips.push('Flight ' + f.flight_number);
+    if (o.hours && ft) chips.push(hhmm(ft) + ' flight time');
+    if (o.night && f.night) chips.push(hhmm(f.night) + ' night');
+    if (o.landings && (f.day_landings || f.night_landings)) chips.push(((f.day_landings || 0) + (f.night_landings || 0)) + ' landing' + (((f.day_landings || 0) + (f.night_landings || 0)) > 1 ? 's' : ''));
+  } else if (sh.note && o.date && sh.note.noted_at) chips.push(new Date(sh.note.noted_at).toLocaleDateString('en-ZA', {day: '2-digit', month: 'long', year: 'numeric'}));
+  return {title, chips};
+}
+async function shareLoadImg(path) {
+  const nb = state.nb, u = nb && nb.urls[path]; if (!u) return null;
+  try { const r = await fetch(u); const b = await r.blob(); return await createImageBitmap(b); } catch (e) { return null; }
+}
+function shareWrap(ctx, text, x, y, maxW, lh, maxLines) {
+  const words = String(text).split(/\s+/); let line = '', n = 0;
+  for (let i = 0; i < words.length; i++) {
+    const t = line ? line + ' ' + words[i] : words[i];
+    if (ctx.measureText(t).width > maxW && line) { ctx.fillText(line, x, y); y += lh; line = words[i]; if (++n >= maxLines) { return y; } }
+    else line = t;
+  }
+  if (line && n < maxLines) { ctx.fillText(line, x, y); y += lh; }
+  return y;
+}
+async function shareRender(sh) {
+  const W = 1080, H = 1350, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d'), {title, chips} = shareLines(sh);
+  const g = ctx.createLinearGradient(0, 0, W, H); g.addColorStop(0, '#006B3F'); g.addColorStop(1, '#00301B'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const pics = []; for (const p of sh.photos.filter(p => p.on).slice(0, 4)) { const b = await shareLoadImg(p.path); if (b) pics.push(b); }
+  let y = 90;
+  ctx.fillStyle = '#FFB612'; ctx.font = '700 34px system-ui, sans-serif'; ctx.fillText('SALOGBOOK', 70, y); y += 30;
+  if (pics.length) {
+    const top = y + 10, areaH = 700, gap = 12, cols = pics.length === 1 ? 1 : 2, rows = pics.length > 2 ? 2 : 1;
+    const cw = (W - 140 - gap * (cols - 1)) / cols, ch = (areaH - gap * (rows - 1)) / rows;
+    pics.forEach((b, i) => {
+      const cx = 70 + (i % cols) * (cw + gap), cy = top + Math.floor(i / cols) * (ch + gap), s = Math.max(cw / b.width, ch / b.height);
+      ctx.save(); ctx.beginPath(); ctx.rect(cx, cy, cw, ch); ctx.clip();
+      ctx.drawImage(b, cx + (cw - b.width * s) / 2, cy + (ch - b.height * s) / 2, b.width * s, b.height * s); ctx.restore();
+    });
+    y = top + areaH + 70;
+  } else y = 330;
+  ctx.fillStyle = '#fff'; ctx.font = '800 ' + (pics.length ? 64 : 92) + 'px system-ui, sans-serif';
+  y = shareWrap(ctx, title, 70, y, W - 140, pics.length ? 74 : 104, 2) + 10;
+  ctx.font = '600 38px system-ui, sans-serif'; ctx.fillStyle = '#FFB612';
+  chips.forEach(c => { ctx.fillText(c, 70, y); y += 56; });
+  const cap = sh.caption.trim();
+  if (cap && sh.opts.note) { y += 20; ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.font = '400 36px system-ui, sans-serif'; shareWrap(ctx, cap, 70, y, W - 140, 50, pics.length ? 4 : 12); }
+  return cv;
+}
+async function shareRedraw() {
+  const sh = state.share; if (!sh) return;
+  sh.busy = true; render();
+  try { const cv = await shareRender(sh); sh.canvas = cv; sh.canvasUrl = cv.toDataURL('image/jpeg', 0.9); sh.msg = ''; }
+  catch (e) { sh.msg = 'Could not draw the card: ' + (e && e.message ? e.message : e); }
+  sh.busy = false; render();
+}
+function shareBlob(sh) { return new Promise(res => sh.canvas.toBlob(res, 'image/jpeg', 0.9)); }
+async function shareSend() {
+  const sh = state.share; if (!sh || !sh.canvas) return;
+  const blob = await shareBlob(sh), file = new File([blob], 'salogbook-flight.jpg', {type: 'image/jpeg'});
+  try {
+    if (navigator.canShare && navigator.canShare({files: [file]})) { await navigator.share({files: [file], text: sh.opts.note && sh.caption.trim() ? sh.caption.trim() : undefined}); return; }
+  } catch (e) { if (e && e.name === 'AbortError') return; }
+  dlBlob2('salogbook-flight.jpg', blob); sh.msg = 'Sharing is not available here, so the picture was downloaded. Post it from your gallery.'; render();
+}
+function dlBlob2(name, blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
+async function shareDownload() { const sh = state.share; if (!sh || !sh.canvas) return; dlBlob2('salogbook-flight.jpg', await shareBlob(sh)); }
+
+function shareModal() {
+  const sh = state.share; if (!sh) return null;
+  const f = sh.flight, c = div({});
+  c.appendChild(div({style: {background: '#FFF8E1', border: '1px solid #FFE082', borderRadius: '7px', padding: '8px 10px', fontSize: '11px', color: '#6B4E00', lineHeight: '1.5', marginBottom: '10px'}},
+    'Think before you post: share after the flight, not during it. Leave out passengers, crew names, security-sensitive detail and anything your employer\'s social media policy forbids. Only the ticked items appear on the picture; nothing is uploaded by this app.'));
+  const row = (key, label, show) => show === false ? null : el('label', {style: {display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', padding: '3px 0'}},
+    (() => { const i = el('input', {type: 'checkbox'}); i.checked = !!sh.opts[key]; i.addEventListener('change', () => { sh.opts[key] = i.checked; shareRedraw(); }); return i; })(), label);
+  const box = div({style: {marginBottom: '10px'}});
+  [row('route', 'Route (airport codes)', !!f), row('date', 'Date'), row('type', 'Aircraft type', !!f), row('hours', 'Flight time', !!f), row('night', 'Night time', !!(f && f.night)), row('landings', 'Landings', !!f),
+   row('reg', 'Registration (identifies the aircraft)', !!(f && f.aircraft_reg)), row('fno', 'Flight number (identifies the trip)', !!(f && f.flight_number)), row('note', 'Caption text', true)].forEach(r => { if (r) box.appendChild(r); });
+  c.appendChild(box);
+  const ta = el('textarea', {rows: '3', placeholder: 'Caption (optional)', style: {width: '100%', boxSizing: 'border-box', padding: '8px', border: '1px solid #CED4DA', borderRadius: '6px', fontSize: '13px', fontFamily: 'inherit', marginBottom: '8px'}});
+  ta.value = sh.caption; ta.addEventListener('change', () => { sh.caption = ta.value; shareRedraw(); }); c.appendChild(ta);
+  if (sh.photos.length) {
+    c.appendChild(div({style: {fontSize: '12px', fontWeight: '700', marginBottom: '4px'}}, 'Photos (up to 4 on the card)'));
+    const g = div({style: {display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '10px'}});
+    sh.photos.forEach(p => {
+      const u = state.nb && state.nb.urls[p.path], cell = div({style: {position: 'relative', opacity: p.on ? '1' : '.45', cursor: 'pointer'}, onclick: () => { p.on = !p.on; shareRedraw(); }});
+      cell.appendChild(u ? el('img', {src: u, style: {width: '64px', height: '64px', objectFit: 'cover', borderRadius: '6px', border: p.on ? '3px solid #006B3F' : '1px solid #ccc'}}) : div({style: {width: '64px', height: '64px', background: '#eee', borderRadius: '6px'}}));
+      g.appendChild(cell);
+    }); c.appendChild(g);
+  }
+  c.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '4px'}}, sh.busy ? 'Drawing the card...' : 'Preview'));
+  if (sh.canvasUrl) c.appendChild(el('img', {src: sh.canvasUrl, style: {width: '100%', maxWidth: '320px', borderRadius: '8px', border: '1px solid #DEE2E6', display: 'block', marginBottom: '10px'}}));
+  if (sh.msg) c.appendChild(div({style: {fontSize: '11px', color: '#B26A00', marginBottom: '8px'}}, sh.msg));
+  c.appendChild(div({style: {display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap'}},
+    btn({style: {width: 'auto', background: '#fff', border: '1px solid #006B3F', color: '#006B3F', borderRadius: '7px', padding: '8px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: shareDownload}, 'Download picture'),
+    btn({style: {width: 'auto', background: '#006B3F', border: 'none', color: '#FFB612', borderRadius: '7px', padding: '8px 16px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: shareSend}, 'Share...')));
+  return modal('Share', c, shareClose);
+}
+
 function nbRender(main) {
   const nb = nbState();
   main.appendChild(div({style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px', marginBottom: '12px'}},
@@ -5244,6 +5366,8 @@ function render() {
     app.appendChild(modal((state.editFlight&&state.editFlight.id&&state.editFlight.id!=='new')?'Edit Flight Entry':'New Flight Entry', renderFlightForm(state.editFlight), ()=>{_flightDraftActive=false;_flightDraftData=null;setState({showFlightForm:false,editFlight:null});}, true));
   }
 
+  { const sm = shareModal(); if (sm) app.appendChild(sm); }
+
   // AI Document Scanner Modal
   if (state.showAIScan) {
     const scanContent = div({});
@@ -5523,6 +5647,7 @@ function render() {
     if(f.remarks) content.appendChild(div({style:{background:'var(--bg)',borderRadius:'7px',padding:'9px 12px',marginBottom:'10px',fontSize:'12px',color:'var(--steel)',lineHeight:'1.6',borderLeft:'3px solid var(--green)',border:'1px solid var(--border)',borderLeftColor:'var(--green)'}},f.remarks));
     const brow = div({style:{display:'flex',gap:'8px',justifyContent:'flex-end',paddingTop:'10px',borderTop:'1px solid var(--border)'}});
     brow.appendChild(btn({style:{background:'none',border:'1px solid var(--red)',color:'var(--red)',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',cursor:'pointer'},onclick:()=>deleteFlight(f.id)},'Delete'));
+    brow.appendChild(btn({style:{background:'none',border:'1px solid var(--green)',color:'var(--green)',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>{ if(!state.nb||!state.nb.loaded) nbLoad().then(()=>shareOpen({flight:f})); else shareOpen({flight:f}); }},'Share'));
     brow.appendChild(btn({style:{background:'var(--green)',border:'none',color:'var(--gold)',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>{setState({viewFlight:null,editFlight:f,showFlightForm:true});}},'Edit'));
     content.appendChild(brow);
     app.appendChild(modal('Flight Detail', content, ()=>setState({viewFlight:null})));
