@@ -323,6 +323,7 @@ async function loadAll() {
     state.flights = flights.filter(f => f.pilot_id === uid).sort((a,b) => b.date.localeCompare(a.date));
     state.endorsements = endorsements.filter(e => e.pilot_id === uid);
     state.documents = [];
+    curNotifyOnOpen();
     return;
   }
 
@@ -359,6 +360,7 @@ async function loadAll() {
     idbPutAll('flights', state.flights),
     idbPutAll('endorsements', state.endorsements),
   ]);
+  curNotifyOnOpen();
 }
 
 async function signIn(email, password) {
@@ -1988,6 +1990,109 @@ function curPickerCard() {
   card.appendChild(det);
   card.appendChild(div({style:{fontSize:'10px', color:'#999', marginTop:'8px', lineHeight:'1.5'}},
     'Tracking aid only. Requirements are a starting point based on SACAA CAR Part 61 - always confirm against the current regulation and your operations manual. Your selection is saved on this device.'));
+  return card;
+}
+
+// ---- Lapse alerts: calendar reminders (.ics) and an on-device notification when the app opens ----
+function curLapses(items) {
+  const now = new Date();
+  return (items || curItems()).filter(i => i.daysLeft != null && i.status !== 'none').map(i => ({...i, lapse: new Date(now.getTime() + i.daysLeft * CUR_DAY_MS)})).sort((a, b) => a.daysLeft - b.daysLeft);
+}
+function curIcsText(items) {
+  const z = d => d.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const day = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+  const esc = t => String(t).replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
+  const out = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//SALOGBOOK//Currency//EN', 'CALSCALE:GREGORIAN'];
+  curLapses(items).filter(i => i.daysLeft >= 0).forEach(i => {
+    out.push('BEGIN:VEVENT', 'UID:' + i.id + '-' + day(i.lapse) + '@salogbook', 'DTSTAMP:' + z(new Date()), 'DTSTART;VALUE=DATE:' + day(i.lapse),
+      'SUMMARY:' + esc('Lapses: ' + i.label + ' (' + (i.reg || '') + ')'),
+      'DESCRIPTION:' + esc((i.detail || '') + '. ' + (i.note || '') + ' Count-based items move when you fly - re-download after logging flights.'));
+    [[30, '30 days'], [7, '7 days'], [1, 'tomorrow']].forEach(a => out.push('BEGIN:VALARM', 'ACTION:DISPLAY', 'DESCRIPTION:' + esc(a[0] === 1 ? i.label + ' lapses tomorrow' : i.label + ' lapses in ' + a[1]), 'TRIGGER:-P' + a[0] + 'D', 'END:VALARM'));
+    out.push('END:VEVENT');
+  });
+  out.push('END:VCALENDAR');
+  return out.join('\r\n');
+}
+function dlBlob(name, mime, text) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], {type: mime})); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+function curDownloadIcs() { dlBlob('salogbook-currency-reminders.ics', 'text/calendar', curIcsText()); }
+function curAlertsOn() { try { return localStorage.getItem('salogbook_alerts_on') === '1' && typeof Notification !== 'undefined' && Notification.permission === 'granted'; } catch (e) { return false; } }
+async function curToggleAlerts() {
+  if (curAlertsOn()) { try { localStorage.setItem('salogbook_alerts_on', '0'); } catch (e) {} render(); return; }
+  if (typeof Notification === 'undefined') { alert('This browser does not support notifications. Use the calendar reminders instead.'); return; }
+  const p = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission();
+  if (p === 'granted') { try { localStorage.setItem('salogbook_alerts_on', '1'); } catch (e) {} curNotifyOnOpen(true); }
+  render();
+}
+// Once a day, when the app is opened: tell the pilot what has lapsed or is about to.
+function curNotifyOnOpen(force) {
+  try {
+    if (!state.session || !curAlertsOn() || curNeedsSetup()) return;
+    const today = new Date().toISOString().slice(0, 10);
+    if (!force && localStorage.getItem('salogbook_alerts_last') === today) return;
+    const ls = curLapses().filter(i => i.status === 'bad' || i.daysLeft <= 14);
+    const bad = curItems().filter(i => i.status === 'bad');
+    const names = new Set(); const parts = [];
+    bad.forEach(i => { if (!names.has(i.id)) { names.add(i.id); parts.push(i.label + ' NOT current'); } });
+    ls.filter(i => i.status !== 'bad').forEach(i => { if (!names.has(i.id)) { names.add(i.id); parts.push(i.label + ' in ' + i.daysLeft + 'd'); } });
+    if (!parts.length) return;
+    localStorage.setItem('salogbook_alerts_last', today);
+    new Notification('SALOGBOOK currency', {body: parts.slice(0, 5).join('; ') + (parts.length > 5 ? ' +' + (parts.length - 5) + ' more' : ''), tag: 'salogbook-currency'});
+  } catch (e) { /* notifications are a convenience - never break the app */ }
+}
+function curAlertsCard() {
+  const items = curLapses().filter(i => i.daysLeft >= 0);
+  const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}});
+  card.appendChild(div({style:{fontWeight:'800', fontSize:'14px', marginBottom:'6px'}}, 'Lapse alerts'));
+  if (items.length) {
+    items.slice(0, 5).forEach(i => card.appendChild(div({style:{fontSize:'12px', padding:'2px 0', color: i.daysLeft <= 14 ? '#B26A00' : '#333'}}, i.label + ' - lapses ' + i.lapse.toISOString().slice(0, 10) + ' (' + i.daysLeft + ' days)')));
+  } else card.appendChild(div({style:{fontSize:'12px', color:'#666'}}, 'Nothing is counting down yet - add your medical and rating dates under Endorsements.'));
+  const row = div({style:{display:'flex', gap:'8px', flexWrap:'wrap', marginTop:'10px'}});
+  const bs = {width:'auto', background:'#fff', color:'#006B3F', border:'1px solid #006B3F', borderRadius:'7px', padding:'8px 12px', fontSize:'12px', fontWeight:'700', cursor:'pointer'};
+  row.appendChild(btn({style:bs, onclick:curDownloadIcs}, 'Add reminders to my calendar (.ics)'));
+  row.appendChild(btn({style:bs, onclick:curToggleAlerts}, curAlertsOn() ? 'Turn off alerts on this device' : 'Alert me on this device'));
+  card.appendChild(row);
+  card.appendChild(div({style:{fontSize:'10px', color:'#999', marginTop:'8px', lineHeight:'1.5'}}, 'The calendar file sets reminders 30, 7 and 1 day before each lapse date (works with Google, Apple and Outlook calendars). Device alerts appear once a day when you open the app - they cannot wake your phone while it is closed. Passenger and landing currency moves as you fly, so re-download the calendar file after logging flights.'));
+  return card;
+}
+
+// ---- Logbook export (CSV) ----------------------------------------------------------------------
+function csvCell(v) { v = v == null ? '' : String(v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+const EXPORT_LAYOUTS = {
+  sacaa: {label: 'SACAA / airline layout', cols: [
+    ['Date', f => f.date], ['Aircraft type', f => f.aircraft_type], ['Registration', f => f.aircraft_reg], ['Flight no', f => f.flight_number],
+    ['From', f => f.dep_airport], ['To', f => f.arr_airport], ['Off blocks (UTC)', f => f.chocks_off], ['On blocks (UTC)', f => f.chocks_on],
+    ['Total time (h)', f => f.total_time], ['PIC (h)', f => f.pic], ['P1/S (h)', f => f.p1us], ['SIC (h)', f => f.sic], ['Dual (h)', f => f.dual], ['Instructor (h)', f => f.dual_given],
+    ['Night (h)', f => f.night], ['IFR (h)', f => f.ifr], ['Actual instrument (h)', f => f.actual_inst], ['Sim instrument (h)', f => f.sim_inst], ['Simulator (h)', f => f.sim_time], ['Cross-country (h)', f => f.xc],
+    ['Day take-offs', f => f.day_takeoffs], ['Day landings', f => f.day_landings], ['Night take-offs', f => f.night_takeoffs], ['Night landings', f => f.night_landings],
+    ['Pilot role', f => f.pilot_role], ['Duty role', f => f.duty_role], ['Captain / P1', f => f.p1_name], ['Co-pilot / P2', f => f.p2_name], ['Instructor name', f => f.instructor], ['Remarks', f => f.remarks]]},
+  full: {label: 'Everything', cols: null},
+};
+function exportRows() {
+  const r = state.exportRange || 'all', now = new Date();
+  const cut = r === '12' ? new Date(now.getTime() - 365 * CUR_DAY_MS) : r === '90' ? new Date(now.getTime() - 90 * CUR_DAY_MS) : null;
+  return [...state.flights].filter(f => !cut || curParse(f.date) >= cut).sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+}
+function exportCsv(kind) {
+  const rows = exportRows(); if (!rows.length) { alert('No flights in that range.'); return; }
+  let cols = EXPORT_LAYOUTS[kind].cols;
+  if (!cols) { const keys = []; rows.forEach(f => Object.keys(f).forEach(k => { if (k !== 'pilot_id' && k !== 'approaches' && keys.indexOf(k) < 0) keys.push(k); })); cols = keys.map(k => [k, f => f[k]]); }
+  const text = '﻿' + [cols.map(c => csvCell(c[0])).join(',')].concat(rows.map(f => cols.map(c => csvCell(c[1](f))).join(','))).join('\r\n');
+  const who = (state.profile && state.profile.full_name || 'logbook').replace(/[^A-Za-z0-9]+/g, '_');
+  dlBlob('salogbook_' + who + '_' + kind + '_' + new Date().toISOString().slice(0, 10) + '.csv', 'text/csv;charset=utf-8', text);
+}
+function exportCard() {
+  const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderRadius:'8px', padding:'12px 16px', marginBottom:'14px'}});
+  card.appendChild(div({style:{fontWeight:'800', fontSize:'13px', marginBottom:'6px'}}, 'Download your logbook (spreadsheet / CSV)'));
+  const rs = sel({style:{padding:'6px 10px', border:'1px solid #CED4DA', borderRadius:'6px', fontSize:'12px', marginRight:'8px'}, onchange:e => { state.exportRange = e.target.value; }});
+  [['all', 'All flights'], ['12', 'Last 12 months'], ['90', 'Last 90 days']].forEach(o => rs.appendChild(opt(o[0], o[1], (state.exportRange || 'all') === o[0])));
+  card.appendChild(div({style:{marginBottom:'8px'}}, rs));
+  const bs = {width:'auto', background:'#006B3F', color:'#FFB612', border:'none', borderRadius:'7px', padding:'8px 12px', fontSize:'12px', fontWeight:'700', cursor:'pointer', marginRight:'8px'};
+  card.appendChild(btn({style:bs, onclick:() => exportCsv('sacaa')}, 'SACAA / airline layout'));
+  card.appendChild(btn({style:{...bs, background:'#fff', color:'#006B3F', border:'1px solid #006B3F'}, onclick:() => exportCsv('full')}, 'Everything (all columns)'));
+  card.appendChild(div({style:{fontSize:'10px', color:'#999', marginTop:'6px'}}, 'Opens in Excel or Google Sheets. Times are decimal hours; blocks are UTC. Use "Print / PDF" below for the signed SACAA paper copy.'));
   return card;
 }
 
@@ -4797,6 +4902,7 @@ function render() {
       el('p',{style:{color:'#555',fontSize:'12px',margin:0}},CUR_PROFILES[curPrefs().profileId].label+' - '+now.toLocaleDateString('en-ZA',{day:'2-digit',month:'long',year:'numeric'}))
     ));
     main.appendChild(curSummaryCard(items));
+    main.appendChild(curAlertsCard());
     const listCard = div({style:{background:'#fff',border:'1px solid #DEE2E6',borderRadius:'8px',padding:'6px 18px',marginBottom:'14px'}});
     curSortedByUrgency(items).forEach(i => listCard.appendChild(curItemRow(i,true)));
     main.appendChild(listCard);
@@ -4836,6 +4942,7 @@ function render() {
     ));
     rh.appendChild(btn({style:{background:'var(--green)',border:'none',color:'var(--gold)',borderRadius:'7px',padding:'7px 14px',fontSize:'12px',fontWeight:'700',cursor:'pointer'},onclick:()=>window.print()},'Print / PDF'));
     main.appendChild(rh);
+    main.appendChild(exportCard());
 
     // Report picker - three separate, independently printable reports
     const reportOptions = [
