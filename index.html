@@ -3256,6 +3256,7 @@ function dpxRender(main) {
     div({style: {fontSize: '11px', color: '#555', marginTop: '4px'}}, 'Checks are fixed rules on the documents\' own text. They help you spot issues - they do not replace reading the pack, and they are not a go/no-go decision.')));
 
   main.appendChild(dpxPreDepartureCard(pack));
+  main.appendChild(minCard(pack));
 
   // parser warnings
   const pw = [...(p.warnings || []), ...((pack.folder && pack.folder.warnings) || [])];
@@ -3342,6 +3343,305 @@ function dpxRender(main) {
   const ov = dpxChartOverlay(d); if (ov) main.appendChild(ov);
 }
 
+
+// ================= MINIMA ADVISOR =====================================================
+// Advisory only. The STRUCTURE of the rules (which aerodrome needs which kind of minima, the
+// +/-1 h window, when a second alternate is required) comes from the Civil Aviation Regulations:
+//   CAR 91.07.5 (aerodrome operating minima), 91.07.7 (pre-flight selection of aerodromes),
+//   91.07.8 (planning minima for IFR flights), 121.07.1 / 121.07.20 (Part 121).
+// The NUMBERS (decision height, RVR, visibility) are NOT hard-coded: they are the published minima for
+// the approach the pilot plans to fly, entered per aerodrome. The alternate adjustments below are the
+// commonly quoted SA-CATS 91.07.8 table - verify against the current SA-CATS 91 before relying on them.
+const MIN_LS = 'salogbook_minima_v1';
+const MIN_RULES = {
+  part91:  {label: 'Part 91', long: 'Part 91 - general aviation (CAR 91.07.5, 91.07.7, 91.07.8 and SA-CATS 91)'},
+  part121: {label: 'Part 121', long: 'Part 121 - air transport (CAR 121.07.1 and 121.07.20; SA-CATS 91.07.5 is the lowest your operator may use)'},
+  saa:     {label: 'SAA OM Part 1', long: 'SAA Operations Manual Part 1 - your own company minima'},
+};
+const MIN_ROLES = {
+  dep:     {label: 'Take-off',               needs: 'weather at take-off must be at or above the take-off minima'},
+  tkoalt:  {label: 'Take-off alternate',     needs: 'at or above the landing minima for the approach you would fly, from 1 h before to 1 h after the time you could use it'},
+  era:     {label: 'En-route alternate',     needs: 'at or above the alternate planning minima, 1 h before to 1 h after the time you could use it'},
+  dest:    {label: 'Destination',            needs: 'at or above the landing minima (ceiling too for non-precision or circling), 1 h before to 1 h after ETA'},
+  destalt: {label: 'Destination alternate',  needs: 'at or above the alternate planning minima, 1 h before to 1 h after ETA'},
+};
+const MIN_ROLE_ORDER = ['dep', 'tkoalt', 'era', 'dest', 'destalt'];
+const MIN_APP = {prec: 'Precision (ILS CAT I)', npa: 'Non-precision', circ: 'Circling'};
+
+function minLoad() {
+  try { const s = JSON.parse(localStorage.getItem(MIN_LS) || 'null'); if (s && typeof s === 'object') return {rules: '', aero: {}, tko: {}, saa: {configured: false, roles: {}}, ...s}; } catch (e) { /* ignore corrupt */ }
+  return {rules: '', aero: {}, tko: {}, saa: {configured: false, roles: {}}};
+}
+function minSave(s) { try { localStorage.setItem(MIN_LS, JSON.stringify(s)); } catch (e) { /* storage full or blocked */ } }
+const minNum = v => { const n = parseFloat(v); return isFinite(n) && n >= 0 ? n : null; };
+
+// Which approach the pilot plans to fly at this aerodrome.
+function minPlanned(aero) {
+  aero = aero || {};
+  const has = k => aero[k] && aero[k].v != null;
+  if (aero.plan && has(aero.plan)) return aero.plan;
+  return ['prec', 'npa', 'circ'].find(has) || null;
+}
+// Landing minima of the planned approach: {ceil, vis, kind}. A precision approach has a decision height, not a ceiling requirement.
+function minLanding(aero) {
+  const k = minPlanned(aero); if (!k) return null;
+  const a = aero[k];
+  return {kind: k, ceil: k === 'prec' ? null : a.h, vis: a.v, dh: a.h};
+}
+
+// Required minima for one role at one aerodrome. Returns {ceil, vis, basis[], missing[], blocked}
+function minRequired(rules, role, aero, store) {
+  aero = aero || {};
+  const out = {ceil: null, vis: null, basis: [], missing: [], blocked: ''};
+  if (!rules) { out.blocked = 'Choose the rules you are operating under first.'; return out; }
+  if (rules === 'saa' && !store.saa.configured) { out.blocked = 'SAA OM Part 1 minima have not been entered yet. Enter them from your Operations Manual (button below) - this app does not contain SAA\'s proprietary figures.'; return out; }
+  if (role === 'dep') {
+    if (aero.toVis == null) out.missing.push('take-off visibility / RVR for the runway (SA-CATS 91.07.5, or your company figure)');
+    else { out.vis = aero.toVis; out.basis.push('take-off minimum you entered: ' + aero.toVis + ' m'); }
+  } else {
+    const land = minLanding(aero);
+    if (!land) out.missing.push('the minima of the approach you would fly');
+    else if ((role === 'destalt' || role === 'era') && rules !== 'saa') {
+      // Alternate planning minima, as commonly quoted from SA-CATS 91.07.8
+      if (land.kind === 'prec') {
+        if (aero.npa && aero.npa.v != null) { out.ceil = aero.npa.h; out.vis = aero.npa.v; out.basis.push('precision approach planned: alternate uses the non-precision minima'); }
+        else if (aero.circ && aero.circ.v != null) { out.ceil = aero.circ.h; out.vis = aero.circ.v; out.basis.push('precision approach planned: alternate uses the circling minima (no non-precision entered)'); }
+        else out.missing.push('non-precision or circling minima (an alternate with an ILS is planned to the non-precision minima)');
+      } else if (land.kind === 'npa') {
+        out.ceil = land.ceil + 200; out.vis = land.vis + 1000; out.basis.push('non-precision: MDH + 200 ft and visibility + 1000 m');
+      } else { out.ceil = land.ceil; out.vis = land.vis; out.basis.push('circling: circling minima'); }
+    } else if (land) {
+      out.ceil = land.ceil; out.vis = land.vis;
+      out.basis.push(land.kind === 'prec' ? 'precision approach: RVR/visibility (no ceiling requirement)' : MIN_APP[land.kind] + ' approach: ceiling at or above MDH and visibility at or above the approach minimum');
+    }
+    if (rules === 'saa' && land) {
+      const c = (store.saa.roles || {})[role] || {};
+      if (c.addC != null && out.ceil != null) out.ceil += c.addC;
+      if (c.addV != null && out.vis != null) out.vis += c.addV;
+      if (c.floorC != null) out.ceil = Math.max(out.ceil == null ? 0 : out.ceil, c.floorC);
+      if (c.floorV != null) out.vis = Math.max(out.vis == null ? 0 : out.vis, c.floorV);
+      out.basis = ['SAA OM Part 1 entries for this role applied to the planned approach (' + MIN_APP[land.kind] + ')'];
+    }
+  }
+  if (rules === 'saa' && role === 'dep') {
+    const c = (store.saa.roles || {}).dep || {};
+    if (c.addV != null && out.vis != null) out.vis += c.addV;
+    if (c.floorV != null) out.vis = Math.max(out.vis == null ? 0 : out.vis, c.floorV);
+    out.basis = ['SAA OM Part 1 take-off entry applied'];
+  }
+  return out;
+}
+
+// Effective vis / ceiling for each forecast period, carrying forward what a group does not restate.
+function minTafTimeline(taf) {
+  if (!taf || !taf.periods) return [];
+  const eff = (p, base) => {
+    const e = {vis: p.vis_m, ceil: p.ceiling_ft};
+    if (p.cavok) { e.vis = 9999; e.ceil = null; }
+    else {
+      if (e.vis == null && base) e.vis = base.vis;
+      if (!p.clouds.length && !p.noCloud && base) e.ceil = base.ceil;
+    }
+    return e;
+  };
+  const main = taf.periods.filter(p => p.kind === 'BASE' || p.kind === 'FM' || p.kind === 'BECMG').slice().sort((a, b) => ((a.from || 0) - (b.from || 0)));
+  const rows = []; let prev = null;
+  main.forEach((p, i) => {
+    const e = eff(p, p.kind === 'FM' ? null : prev);
+    const next = main[i + 1];
+    rows.push({kind: p.kind, from: p.from || taf.from, to: (next && next.from) || taf.to, ...e, soft: false, label: (p.kind === 'BASE' ? 'TAF' : p.kind) + ' ' + brfHHMM(p.from || taf.from)});
+    prev = e;
+  });
+  taf.periods.filter(p => p.kind === 'TEMPO' || p.kind === 'PROB').forEach(p => {
+    if (p.kind === 'PROB' && p.prob != null && p.prob < 40) return;   // under 40% does not limit (use judgment)
+    const at = p.from || taf.from;
+    const base = rows.filter(r => r.from <= at).pop() || rows[0];
+    rows.push({kind: p.kind, from: p.from || taf.from, to: p.to || taf.to, ...eff(p, base), soft: true, label: (p.kind === 'PROB' ? 'PROB' + p.prob : 'TEMPO') + ' ' + brfHHMM(p.from)});
+  });
+  return rows;
+}
+
+// Compare the weather of one station with a requirement inside a window.
+function minEvaluate(an, req, win, includeMetar) {
+  const rows = [];
+  const below = (vis, ceil) => {
+    const w = [];
+    if (req.vis != null && vis != null && vis < req.vis) w.push('visibility ' + brfFmtVis(vis) + ' < ' + req.vis + ' m');
+    if (req.ceil != null && ceil != null && ceil < req.ceil) w.push('ceiling ' + ceil + ' ft < ' + req.ceil + ' ft');
+    return w;
+  };
+  if (includeMetar && an.metar) {
+    const m = an.metar, vis = m.cavok ? 9999 : m.vis_m, ceil = m.cavok ? null : m.ceiling_ft;
+    rows.push({label: 'METAR ' + (m.obsTime ? brfHHMM(m.obsTime) : ''), vis, ceil, soft: false, why: below(vis, ceil)});
+    m.trends.forEach(t => { const v = t.cavok ? 9999 : (t.vis_m != null ? t.vis_m : vis), c = t.cavok ? null : (t.clouds.length ? t.ceiling_ft : ceil); rows.push({label: 'METAR trend ' + t.kind, vis: v, ceil: c, soft: true, why: below(v, c)}); });
+  }
+  minTafTimeline(an.taf).forEach(r => {
+    if (win && ((r.to && r.to <= win.from) || (r.from && r.from >= win.to))) return;
+    rows.push({label: r.label, vis: r.vis, ceil: r.ceil, soft: r.soft, why: below(r.vis, r.ceil)});
+  });
+  const hard = rows.filter(r => !r.soft && r.why.length), soft = rows.filter(r => r.soft && r.why.length);
+  let verdict = 'ok', text = 'Observed and forecast weather in the window is at or above the required minima.';
+  if (!an.taf && !(includeMetar && an.metar)) { verdict = 'warn'; text = 'No forecast available - you cannot show the weather will be at or above minima.'; }
+  else if (!an.taf) { verdict = 'warn'; text = 'No TAF - only the current METAR was checked.'; if (rows.some(r => !r.soft && r.why.length)) { verdict = 'bad'; text = 'The current METAR is below the required minima.'; } }
+  else if (hard.length) { verdict = 'bad'; text = 'Below the required minima: ' + hard[0].label + ' (' + hard[0].why.join(', ') + ').'; }
+  else if (soft.length) { verdict = 'warn'; text = 'Only a temporary/probable period dips below minima: ' + soft[0].label + ' (' + soft[0].why.join(', ') + ').'; }
+  return {verdict, text, rows};
+}
+
+// Which minima roles apply to a station of the dispatch pack.
+function minRolesFor(st, plan, store) {
+  const out = [];
+  const rs = st.roles || [];
+  if (rs.some(r => /Departure/.test(r))) out.push('dep');
+  if (rs.some(r => /Destination/.test(r))) out.push('dest');
+  if (rs.some(r => /Alternate/.test(r))) out.push('destalt');
+  if (rs.some(r => /ETP|Enroute/.test(r))) out.push('era');
+  if ((store.tko || {})[plan.dep + '-' + plan.arr] === st.icao) out.push('tkoalt');
+  return out;
+}
+function minWindow(role, plan, an) {
+  const m = x => new Date(x.getTime());
+  const add = (d, mm) => new Date(d.getTime() + mm * 60000);
+  if (role === 'dep') return {from: add(plan.etd, -30), to: add(plan.etd, 30)};
+  if (role === 'tkoalt') return {from: add(plan.etd, -60), to: add(plan.etd, 120)};
+  if (role === 'dest' || role === 'destalt') return {from: add(plan.eta, -60), to: add(plan.eta, 60)};
+  return an.window ? {from: an.window.from, to: an.window.to} : {from: plan.etd, to: plan.eta};
+}
+function minAnalysePack(pack, store) {
+  const p = pack.plan, res = [];
+  pack.stations.forEach(an => {
+    minRolesFor(an, p, store).forEach(role => {
+      const aero = store.aero[an.icao] || {};
+      const req = minRequired(store.rules, role, aero, store);
+      const win = minWindow(role, p, an);
+      const ev = (!req.blocked && !req.missing.length) ? minEvaluate(an, req, win, role === 'dep') : null;
+      res.push({icao: an.icao, name: an.name, role, req, win, ev});
+    });
+  });
+  // alternate planning rules
+  const advice = [];
+  const dest = res.find(r => r.role === 'dest'), dep = res.find(r => r.role === 'dep');
+  const nAlt = res.filter(r => r.role === 'destalt').length;
+  if (dest && dest.ev) {
+    if (dest.ev.verdict === 'bad' || (dest.ev.verdict === 'warn' && /No forecast|No TAF/.test(dest.ev.text))) {
+      advice.push({sev: nAlt >= 2 ? 'warn' : 'bad', text: 'The destination is not shown to be at or above planning minima (' + dest.ev.text + ') - two destination alternates are required (CAR 91.07.7(10) for Part 91, CAR 121.07.1(4) for Part 121). The plan has ' + nAlt + '.'});
+    } else advice.push({sev: 'ok', text: 'Destination forecast is at or above planning minima, so one destination alternate satisfies the number-of-alternates rule (the plan has ' + nAlt + ').'});
+  } else if (dest) advice.push({sev: 'info', text: 'Destination minima cannot be checked yet - ' + (dest.req.blocked || ('enter ' + dest.req.missing.join(', '))) + '.'});
+  if (dep && dep.ev) {
+    const tko = res.some(r => r.role === 'tkoalt');
+    if (dep.ev.verdict === 'bad') advice.push({sev: tko ? 'warn' : 'bad', text: 'Weather at the departure aerodrome is at or below the take-off minima (' + dep.ev.text + '). A take-off alternate must be selected and named on the flight plan' + (tko ? ' (you have marked one below).' : ' - mark one below to check it.')});
+    else if (dep.ev.verdict === 'ok') advice.push({sev: 'ok', text: 'Departure weather is at or above the take-off minima. A take-off alternate is still needed if you could not return to the departure aerodrome for performance or other reasons.'});
+  }
+  return {rows: res, advice};
+}
+
+// ---- Minima advisor UI ---------------------------------------------------------------------
+function minNumInput(val, ph, onSet, w) {
+  const i = el('input', {type: 'number', inputmode: 'numeric', min: '0', placeholder: ph, style: {width: w || '78px', padding: '5px 6px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px'}});
+  if (val != null) i.value = String(val);
+  i.addEventListener('change', () => { onSet(minNum(i.value)); render(); });
+  return i;
+}
+function minAeroForm(an, store, roles) {
+  const aero = store.aero[an.icao] = store.aero[an.icao] || {};
+  const upd = fn => v => { fn(v); minSave(store); };
+  const form = div({style: {background: '#F8F9FA', border: '1px solid #E9ECEF', borderRadius: '6px', padding: '8px 10px', marginTop: '6px'}});
+  form.appendChild(div({style: {fontSize: '11px', color: '#555', marginBottom: '6px'}}, 'Minima for ' + an.icao + ' from the approach charts / your operator (saved on this device). Enter only the approaches you could fly.'));
+  ['prec', 'npa', 'circ'].forEach(k => {
+    aero[k] = aero[k] || {};
+    form.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '5px'}},
+      el('span', {style: {fontSize: '12px', width: '130px'}}, MIN_APP[k]),
+      minNumInput(aero[k].h, k === 'prec' ? 'DH ft' : 'MDH ft', upd(v => { aero[k].h = v; })),
+      minNumInput(aero[k].v, 'RVR/vis m', upd(v => { aero[k].v = v; }))));
+  });
+  if (roles.includes('dep')) form.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '5px'}},
+    el('span', {style: {fontSize: '12px', width: '130px'}}, 'Take-off RVR/vis'), minNumInput(aero.toVis, 'm', upd(v => { aero.toVis = v; }))));
+  const avail = ['prec', 'npa', 'circ'].filter(k => aero[k] && aero[k].v != null);
+  if (avail.length > 1) {
+    const s = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px'}}, ...avail.map(k => el('option', {value: k}, MIN_APP[k])));
+    s.value = minPlanned(aero) || avail[0];
+    s.addEventListener('change', () => { aero.plan = s.value; minSave(store); render(); });
+    form.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px'}}, 'Approach you would plan to fly:', s));
+  }
+  return form;
+}
+function minSaaEditor(store) {
+  const det = el('details', {style: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '8px', padding: '8px 12px', marginTop: '10px'}});
+  det.appendChild(el('summary', {style: {cursor: 'pointer', fontWeight: '700', fontSize: '12px'}}, 'SAA OM Part 1 minima ' + (store.saa.configured ? '(entered)' : '(not entered)')));
+  det.appendChild(div({style: {fontSize: '11px', color: '#555', margin: '6px 0'}}, 'Type in what your Operations Manual says for each situation. "Add" is added to the minima of the approach you plan to fly; "lowest allowed" is a floor. Leave a box empty if the OM does not use it. These figures stay on this device.'));
+  MIN_ROLE_ORDER.forEach(r => {
+    const c = store.saa.roles[r] = store.saa.roles[r] || {};
+    const row = div({style: {display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '6px'}}, el('span', {style: {fontSize: '12px', width: '140px', fontWeight: '600'}}, MIN_ROLES[r].label));
+    const mk = (key, ph) => minNumInput(c[key], ph, v => { c[key] = v; minSave(store); }, '86px');
+    if (r !== 'dep') row.appendChild(mk('addC', 'add ft')); row.appendChild(mk('addV', 'add m'));
+    if (r !== 'dep') row.appendChild(mk('floorC', 'lowest ceil ft')); row.appendChild(mk('floorV', 'lowest vis m'));
+    det.appendChild(row);
+  });
+  const done = btn({style: {width: 'auto', background: store.saa.configured ? '#fff' : '#006B3F', color: store.saa.configured ? '#666' : '#FFB612', border: '1px solid #CED4DA', borderRadius: '6px', padding: '7px 14px', fontSize: '12px', cursor: 'pointer'},
+    onclick: () => { store.saa.configured = !store.saa.configured; minSave(store); render(); }}, store.saa.configured ? 'Mark as not entered' : 'I have entered the SAA figures - use them');
+  det.appendChild(done);
+  if (store.saa.configured) det.setAttribute('open', '');
+  return det;
+}
+function minCard(pack) {
+  const store = minLoad(), p = pack.plan;
+  const card = div({style: {background: '#fff', border: '1px solid #DEE2E6', borderLeft: '6px solid #006B3F', borderRadius: '10px', padding: '14px 18px', marginBottom: '14px'}});
+  card.appendChild(div({style: {fontWeight: '800', fontSize: '15px', marginBottom: '2px'}}, 'Weather minima advisor'));
+  card.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '10px'}}, 'Which minima apply at take-off, the alternates and the destination, and whether the weather in the pack meets them. Advisory only - the minima in your approved documents and the decision stay with you.'));
+  card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', marginBottom: '6px'}}, '1. Which rules are you operating under?'));
+  const row = div({style: {display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px'}});
+  Object.keys(MIN_RULES).forEach(k => {
+    const on = store.rules === k;
+    row.appendChild(btn({style: {width: 'auto', background: on ? '#006B3F' : '#fff', color: on ? '#FFB612' : '#333', border: '1px solid ' + (on ? '#006B3F' : '#CED4DA'), borderRadius: '8px', padding: '8px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: () => { store.rules = k; minSave(store); render(); }}, MIN_RULES[k].label));
+  });
+  card.appendChild(row);
+  if (!store.rules) { card.appendChild(div({style: {fontSize: '12px', color: '#B26A00'}}, 'Select Part 91, Part 121 or SAA OM Part 1 to see the minima.')); return card; }
+  card.appendChild(div({style: {fontSize: '11px', color: '#555', marginBottom: '8px'}}, MIN_RULES[store.rules].long));
+  if (store.rules === 'saa') card.appendChild(minSaaEditor(store));
+  card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '2. Aerodromes in this plan'));
+  const out = minAnalysePack(pack, store);
+  pack.stations.forEach(an => {
+    const roles = minRolesFor(an, p, store), mine = out.rows.filter(r => r.icao === an.icao);
+    const box = div({style: {border: '1px solid #E9ECEF', borderRadius: '8px', padding: '8px 10px', marginBottom: '8px'}});
+    box.appendChild(div({style: {display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '6px'}},
+      el('b', {style: {fontFamily: 'monospace'}}, an.icao + (an.name ? ' ' + an.name : '')),
+      el('span', {style: {fontSize: '11px', color: '#666'}}, (an.roles || []).join(' + '))));
+    mine.forEach(r => {
+      const k = r.req.blocked ? 'warn' : r.req.missing.length ? 'info' : r.ev ? r.ev.verdict : 'info';
+      const lines = [];
+      if (r.req.blocked) lines.push(r.req.blocked);
+      else if (r.req.missing.length) lines.push('Enter ' + r.req.missing.join(', ') + ' below to see the required minima.');
+      else {
+        lines.push('Required: ' + (r.req.vis != null ? 'RVR/visibility at least ' + r.req.vis + ' m' : '') + (r.req.vis != null && r.req.ceil != null ? ', ' : '') + (r.req.ceil != null ? 'ceiling at least ' + r.req.ceil + ' ft' : (r.role === 'dep' ? '' : ' (no ceiling requirement)')) + '. ' + r.req.basis.join('; ') + '.');
+        lines.push(r.ev.text);
+      }
+      const c = BRF_COL[k];
+      const rb = div({style: {background: c.bg, border: '1px solid ' + c.bd, color: c.fg, borderRadius: '6px', padding: '6px 10px', fontSize: '12px', marginTop: '6px', lineHeight: '1.5'}},
+        el('b', {}, MIN_ROLES[r.role].label), el('span', {style: {fontSize: '10px', marginLeft: '6px'}}, 'checked ' + brfHHMM(r.win.from) + ' - ' + brfHHMM(r.win.to)));
+      lines.forEach(l => rb.appendChild(div({}, l)));
+      if (r.ev && r.ev.rows.length) {
+        const d = el('details', {style: {marginTop: '3px'}}, el('summary', {style: {cursor: 'pointer', fontSize: '11px'}}, 'Weather compared (' + r.ev.rows.length + ')'));
+        r.ev.rows.forEach(w => d.appendChild(div({style: {fontSize: '11px', fontFamily: 'monospace'}}, (w.why.length ? '✗ ' : '✓ ') + w.label + '  vis ' + brfFmtVis(w.vis) + '  ceil ' + (w.ceil == null ? 'none' : w.ceil + ' ft') + (w.soft ? '  (temporary)' : ''))));
+        rb.appendChild(d);
+      }
+      box.appendChild(rb);
+    });
+    const tkoOn = (store.tko || {})[p.dep + '-' + p.arr] === an.icao;
+    const cb = el('input', {type: 'checkbox', style: {width: '16px', height: '16px', marginRight: '6px'}});
+    cb.checked = tkoOn;
+    cb.addEventListener('change', () => { store.tko = store.tko || {}; if (cb.checked) store.tko[p.dep + '-' + p.arr] = an.icao; else delete store.tko[p.dep + '-' + p.arr]; minSave(store); render(); });
+    box.appendChild(el('label', {style: {display: 'flex', alignItems: 'center', fontSize: '11px', color: '#555', marginTop: '6px', cursor: 'pointer'}}, cb, 'Use ' + an.icao + ' as the take-off alternate'));
+    const det = el('details', {style: {marginTop: '4px'}}, el('summary', {style: {cursor: 'pointer', fontSize: '11px', color: '#0066CC'}}, 'Approach minima for ' + an.icao));
+    det.appendChild(minAeroForm(an, store, roles));
+    box.appendChild(det);
+    card.appendChild(box);
+  });
+  card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '3. Alternates required'));
+  if (!out.advice.length) card.appendChild(div({style: {fontSize: '12px', color: '#555'}}, 'Enter the approach minima above to see whether the plan has enough alternates.'));
+  out.advice.forEach(a => card.appendChild(dpxFindingRow({sev: a.sev, area: 'Alternates', text: a.text})));
+  card.appendChild(div({style: {fontSize: '10px', color: '#888', marginTop: '8px', lineHeight: '1.5'}}, 'Basis: ±1 h of ETA window and the alternate rules follow CAR 91.07.7 / 91.07.8 / 121.07.1. The alternate adjustments (precision → non-precision minima; non-precision +200 ft and +1000 m; circling → circling) are the commonly quoted SA-CATS 91.07.8 table - confirm against the current SA-CATS 91 and your operator\'s approved minima. TEMPO/INTER periods are shown as cautions; PROB under 40% is ignored (use judgment).'));
+  return card;
+}
 
 function render() {
   const app = document.getElementById('app');
