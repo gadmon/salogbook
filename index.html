@@ -3948,7 +3948,7 @@ function minFloor(k, a, aero, cat) {
   if (h == null) return null;
   if (k === 'npa') { const r = h < 300 ? 0 : h < 450 ? 1 : h < 650 ? 2 : 3; const v = MIN_NPA[fac][r][ci]; return {v, text: 'SA-CATS 91.07.5 lowest RVR for MDH ' + h + ' ft, category ' + (cat || 'C') + ', ' + fac + ' lights: ' + v + ' m' + facTxt + (h < 250 ? ' (MDH below 250 ft is not normally allowed for non-precision)' : '')}; }
   if (k === 'prec') {
-    if (aero.precCat === 'II') { const v = h <= 120 ? 300 : h <= 140 ? 400 : 450; return {v, text: 'SA-CATS 91.07.5 CAT II lowest RVR for DH ' + h + ' ft: ' + v + ' m (approval required)'}; }
+    if (aero.precCat === 'II') { const v = h <= 120 ? ((cat === 'D' || cat === 'E') ? 350 : 300) : h <= 140 ? 400 : 450; return {v, text: 'SA-CATS 91.07.5 CAT II lowest RVR for DH ' + h + ' ft: ' + v + ' m (approval required)'}; }
     const row = MIN_CATI.find(r => h <= r[0]); const v = row[1][{full: 0, int: 1, basic: 2, nil: 3}[fac]];
     return {v, text: 'SA-CATS 91.07.5 CAT I lowest RVR for DH ' + h + ' ft, ' + fac + ' lights: ' + v + ' m' + facTxt};
   }
@@ -3966,6 +3966,20 @@ function minEff(aero, store) {
     e[k] = o;
   });
   return e;
+}
+// SA-CATS 91.07.5 section 1 (take-off minima), as published online. Table 1 for multi-engine aeroplanes that can
+// stop or continue to 1 500 ft after a critical power unit failure is NOT in the published text, so no figure is invented for it.
+const MIN_ENG = {
+  single:   'Single-engine',
+  multi_no: 'Multi-engine - cannot stop or continue to 1 500 ft after a critical engine failure',
+  multi_ok: 'Multi-engine - can stop or continue to 1 500 ft after a critical engine failure',
+};
+function minTkoFloor(store) {
+  const e = store && store.eng;
+  if (e === 'single') return {v: 800, text: 'SA-CATS 91.07.5 s1(3)(a): single-engine take-off minimum not below 800 m'};
+  if (e === 'multi_no') return store.tko400 ? {v: 400, text: 'SA-CATS 91.07.5 s1(3)(c): 400 m allowed only with the Director\'s approval of your obstacle-clearance method'} : {v: 800, text: 'SA-CATS 91.07.5 s1(3)(c): not below 800 m (400 m only with the Director\'s approval)'};
+  if (e === 'multi_ok') return {v: null, text: 'SA-CATS 91.07.5 s1(3)(b): multi-engine with engine-failure performance may use the lower figures in the take-off table of that section, which is not in the published text - use the figure from your operator\'s approval or the table in your copy of SA-CATS 91'};
+  return null;
 }
 // Which approach the pilot plans to fly at this aerodrome.
 function minPlanned(aero) {
@@ -3989,7 +4003,13 @@ function minRequired(rules, role, aero, store) {
   const out = {ceil: null, vis: null, basis: [], missing: [], blocked: ''};
   if (!rules) { out.blocked = 'Choose the rules you are operating under first.'; return out; }
   if (role === 'dep') {
-    if (aero.toVis == null) out.missing.push(rules === 'saa' ? 'take-off visibility/RVR (pick the facilities row from the FOM table, or type it)' : 'take-off visibility / RVR for the runway (SA-CATS 91.07.5, or your operator\'s figure)');
+    const fl = rules === 'saa' ? null : minTkoFloor(store || {});
+    if (fl && fl.v != null) {
+      if (aero.toVis == null || aero.toVis < fl.v) { out.vis = fl.v; out.basis.push('take-off minimum: ' + fl.v + ' m (' + fl.text + ')' + (aero.toVis != null ? ' - your figure ' + aero.toVis + ' m is below it, so it is raised' : '')); }
+      else { out.vis = aero.toVis; out.basis.push('take-off minimum: ' + aero.toVis + ' m (your figure; the lowest allowed is ' + fl.v + ' m)'); }
+      return out;
+    }
+    if (aero.toVis == null) out.missing.push(rules === 'saa' ? 'take-off visibility/RVR (pick the facilities row from the FOM table, or type it)' : (fl ? 'take-off visibility / RVR for your multi-engine aeroplane - ' + fl.text : 'say whether the aeroplane is single- or multi-engine (below) or type the take-off visibility / RVR for the runway'));
     else { out.vis = aero.toVis; out.basis.push('take-off minimum: ' + aero.toVis + ' m'); }
     return out;
   }
@@ -4211,6 +4231,13 @@ function minCard(pack) {
   { const cs = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px'}}, ...[['A', 'A (under 91 kt)'], ['B', 'B (91-120 kt)'], ['C', 'C (121-140 kt)'], ['D', 'D/E (141 kt+)']].map(o => el('option', {value: o[0]}, o[1])));
     cs.value = store.cat || 'C'; cs.addEventListener('change', () => { store.cat = cs.value; minSave(store); render(); });
     card.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px', marginBottom: '8px'}}, 'Aeroplane approach category:', cs)); }
+  if (store.rules === 'part91' || store.rules === 'part121') {
+    const es = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px', maxWidth: '100%'}}, el('option', {value: ''}, 'Choose...'), ...Object.keys(MIN_ENG).map(k => el('option', {value: k}, MIN_ENG[k])));
+    es.value = store.eng || ''; es.addEventListener('change', () => { store.eng = es.value || undefined; minSave(store); render(); });
+    const ec = el('input', {type: 'checkbox'}); ec.checked = !!store.tko400; ec.addEventListener('change', () => { store.tko400 = ec.checked; minSave(store); render(); });
+    card.appendChild(div({style: {fontSize: '12px', marginBottom: '8px'}}, div({style: {marginBottom: '3px'}}, 'Aeroplane type for take-off minima (SA-CATS 91.07.5):'), es,
+      store.eng === 'multi_no' ? el('label', {style: {display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', fontSize: '11px'}}, ec, 'The Director has approved my obstacle-clearance method (allows 400 m)') : null));
+  }
   card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '2. Aerodromes in this plan'));
   const out = minAnalysePack(pack, store);
   pack.stations.forEach(an => {
