@@ -3355,8 +3355,8 @@ function dpxRender(main) {
 const MIN_LS = 'salogbook_minima_v1';
 const MIN_RULES = {
   part91:  {label: 'Part 91', long: 'Part 91 - general aviation (CAR 91.07.5, 91.07.7, 91.07.8 and SA-CATS 91)'},
-  part121: {label: 'Part 121', long: 'Part 121 - air transport (CAR 121.07.1 and 121.07.20; SA-CATS 91.07.5 is the lowest your operator may use)'},
-  saa:     {label: 'SAA OM Part 1', long: 'SAA Operations Manual Part 1 - your own company minima'},
+  part121: {label: 'Part 121', long: 'Part 121 - air transport (SA-CATS 121 TS 121.07.1 alternate table; SA-CATS 91.07.5 is the lowest your operator may use)'},
+  saa:     {label: 'SAA OM Part 1', long: 'SAA Flight Operations Manual (OM Part 1) Rev 21.1, 13 Feb 2026 - chapter 8.1.3.2 (take-off), 8.1.3.3.13 (planning minima), 8.5 (ETOPS/EDTO)'},
 };
 const MIN_ROLES = {
   dep:     {label: 'Take-off',               needs: 'weather at take-off must be at or above the take-off minima'},
@@ -3390,45 +3390,49 @@ function minLanding(aero) {
 }
 
 // Required minima for one role at one aerodrome. Returns {ceil, vis, basis[], missing[], blocked}
+// Sources (uploaded documents): CATS 91 TS 91.07.8 Table 1; SA-CATS 121 TS 121.07.1 table;
+// SAA FOM (OM Part 1) Rev 21.1, 13 Feb 2026, ch 8.1.3.2 / 8.1.3.3.13 / 8.5.
 function minRequired(rules, role, aero, store) {
   aero = aero || {};
   const out = {ceil: null, vis: null, basis: [], missing: [], blocked: ''};
   if (!rules) { out.blocked = 'Choose the rules you are operating under first.'; return out; }
-  if (rules === 'saa' && !store.saa.configured) { out.blocked = 'SAA OM Part 1 minima have not been entered yet. Enter them from your Operations Manual (button below) - this app does not contain SAA\'s proprietary figures.'; return out; }
   if (role === 'dep') {
-    if (aero.toVis == null) out.missing.push('take-off visibility / RVR for the runway (SA-CATS 91.07.5, or your company figure)');
-    else { out.vis = aero.toVis; out.basis.push('take-off minimum you entered: ' + aero.toVis + ' m'); }
-  } else {
-    const land = minLanding(aero);
-    if (!land) out.missing.push('the minima of the approach you would fly');
-    else if ((role === 'destalt' || role === 'era') && rules !== 'saa') {
-      // Alternate planning minima, as commonly quoted from SA-CATS 91.07.8
-      if (land.kind === 'prec') {
-        if (aero.npa && aero.npa.v != null) { out.ceil = aero.npa.h; out.vis = aero.npa.v; out.basis.push('precision approach planned: alternate uses the non-precision minima'); }
-        else if (aero.circ && aero.circ.v != null) { out.ceil = aero.circ.h; out.vis = aero.circ.v; out.basis.push('precision approach planned: alternate uses the circling minima (no non-precision entered)'); }
-        else out.missing.push('non-precision or circling minima (an alternate with an ILS is planned to the non-precision minima)');
-      } else if (land.kind === 'npa') {
-        out.ceil = land.ceil + 200; out.vis = land.vis + 1000; out.basis.push('non-precision: MDH + 200 ft and visibility + 1000 m');
-      } else { out.ceil = land.ceil; out.vis = land.vis; out.basis.push('circling: circling minima'); }
-    } else if (land) {
-      out.ceil = land.ceil; out.vis = land.vis;
-      out.basis.push(land.kind === 'prec' ? 'precision approach: RVR/visibility (no ceiling requirement)' : MIN_APP[land.kind] + ' approach: ceiling at or above MDH and visibility at or above the approach minimum');
-    }
-    if (rules === 'saa' && land) {
-      const c = (store.saa.roles || {})[role] || {};
-      if (c.addC != null && out.ceil != null) out.ceil += c.addC;
-      if (c.addV != null && out.vis != null) out.vis += c.addV;
-      if (c.floorC != null) out.ceil = Math.max(out.ceil == null ? 0 : out.ceil, c.floorC);
-      if (c.floorV != null) out.vis = Math.max(out.vis == null ? 0 : out.vis, c.floorV);
-      out.basis = ['SAA OM Part 1 entries for this role applied to the planned approach (' + MIN_APP[land.kind] + ')'];
-    }
+    if (aero.toVis == null) out.missing.push(rules === 'saa' ? 'take-off visibility/RVR (pick the facilities row from the FOM table, or type it)' : 'take-off visibility / RVR for the runway (SA-CATS 91.07.5, or your operator\'s figure)');
+    else { out.vis = aero.toVis; out.basis.push('take-off minimum: ' + aero.toVis + ' m'); }
+    return out;
   }
-  if (rules === 'saa' && role === 'dep') {
-    const c = (store.saa.roles || {}).dep || {};
-    if (c.addV != null && out.vis != null) out.vis += c.addV;
-    if (c.floorV != null) out.vis = Math.max(out.vis == null ? 0 : out.vis, c.floorV);
-    out.basis = ['SAA OM Part 1 take-off entry applied'];
+  const land = minLanding(aero);
+  if (!land) { out.missing.push('the minima of the approach you would fly'); return out; }
+  const alt = role === 'destalt' || role === 'era';
+  if (!alt) {     // destination and take-off alternate: the landing minima themselves
+    out.ceil = land.ceil; out.vis = land.vis;
+    out.basis.push(land.kind === 'prec' ? 'precision approach: RVR/visibility (no ceiling requirement)' : MIN_APP[land.kind] + ': ceiling at or above MDH and visibility at or above the approach minimum');
+    return out;
   }
+  if (rules === 'part91') {            // CATS 91 TS 91.07.8 Table 1
+    if (land.kind === 'prec') {
+      if (aero.npa && aero.npa.v != null) { out.ceil = aero.npa.h; out.vis = aero.npa.v; out.basis.push('TS 91.07.8 Table 1: Cat I - non-precision minima, ceiling above MDH (Cat II/III operators may plan to Cat I minima)'); }
+      else if (aero.circ && aero.circ.v != null) { out.ceil = aero.circ.h; out.vis = aero.circ.v; out.basis.push('no non-precision minima entered - circling minima used; check the table'); }
+      else out.missing.push('non-precision minima (an alternate with an ILS is planned to the non-precision minima)');
+    } else if (land.kind === 'npa') { out.ceil = land.ceil + 200; out.vis = land.vis + 1000; out.basis.push('TS 91.07.8 Table 1: non-precision - MDH + 200 ft, visibility + 1000 m'); }
+    else { out.ceil = land.ceil; out.vis = land.vis; out.basis.push('TS 91.07.8 Table 1: circling minima'); }
+  } else if (rules === 'part121') {    // SA-CATS 121 TS 121.07.1(1)
+    const f = aero.fac || 'A';
+    if (f === 'C2' || f === 'C3') {
+      out.ceil = f === 'C2' ? 300 : 200; out.vis = f === 'C2' ? 1200 : 550;
+      out.basis.push('TS 121.07.1: two approaches to different runways, one ' + (f === 'C2' ? 'CAT II: ceiling at least 300 ft, RVR at least 1200 m' : 'CAT III: ceiling at least 200 ft, RVR at least 550 m'));
+    } else {
+      const inc = f === 'B' ? [200, 800] : [400, 1500];
+      out.ceil = (land.dh != null ? land.dh : 0) + inc[0]; out.vis = land.vis + inc[1];
+      out.basis.push('TS 121.07.1: ' + (f === 'B' ? 'straight-in approaches to different suitable runways' : 'not straight-in approaches to two runway ends') + ' - applicable minima + ' + inc[0] + ' ft and + ' + inc[1] + ' m');
+    }
+  } else if (rules === 'saa') {        // SAA FOM 8.1.3.3.13 / 8.5 (EASA-style table)
+    const typeA = land.kind !== 'prec' || (land.dh != null && land.dh >= 250);
+    if (land.kind === 'circ') { out.ceil = land.dh + 400; out.vis = land.vis + 1500; out.basis.push('SAA FOM 8.1.3.3.13: circling - MDA/H + 400 ft, VIS + 1500 m'); }
+    else if (typeA) { out.ceil = land.dh + 400; out.vis = land.vis + 1500; out.basis.push('SAA FOM 8.1.3.3.13: Type A approach (MDH/DH 250 ft or more) - + 400 ft, + 1500 m'); }
+    else { out.ceil = land.dh + 200; out.vis = land.vis + 800; out.basis.push('SAA FOM 8.1.3.3.13: Type B approach (DH below 250 ft) - DH + 200 ft, RVR/VIS + 800 m'); }
+  }
+  if (out.ceil == null && land.kind === 'prec' && rules !== 'part91') out.missing.push('the DH of the approach');
   return out;
 }
 
@@ -3556,6 +3560,11 @@ function minAeroForm(an, store, roles) {
   });
   if (roles.includes('dep')) form.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '5px'}},
     el('span', {style: {fontSize: '12px', width: '130px'}}, 'Take-off RVR/vis'), minNumInput(aero.toVis, 'm', upd(v => { aero.toVis = v; }))));
+  const smallSel = (opts, cur, on) => { const x = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px', maxWidth: '100%'}}, ...opts.map(o => el('option', {value: o[0]}, o[1]))); x.value = cur; x.addEventListener('change', () => { on(x.value); minSave(store); render(); }); return x; };
+  if (store.rules === 'part121') form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'Alternate aerodrome facilities (TS 121.07.1):'),
+    smallSel([['A', 'Not straight-in to two runway ends (+400 ft, +1500 m)'], ['B', 'Straight-in to different suitable runways (+200 ft, +800 m)'], ['C2', 'Two approaches, one CAT II (300 ft / RVR 1200)'], ['C3', 'Two approaches, one CAT III (200 ft / RVR 550)']], aero.fac || 'A', v => { aero.fac = v; })));
+  if (store.rules === 'saa' && roles.includes('dep')) form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'SAA FOM take-off table (without LVTO approval):'),
+    smallSel([['', 'Choose...'], ['500', 'Nil facilities, day: 500 m'], ['400', 'Centre line markings / edge or CL lights, day: 400 m'], ['400n', 'Night with end lights + edge/CL lights: 400 m']], aero.toVis === 500 ? '500' : (aero.toVis === 400 ? '400' : ''), v => { if (v) aero.toVis = parseInt(v, 10); })));
   const avail = ['prec', 'npa', 'circ'].filter(k => aero[k] && aero[k].v != null);
   if (avail.length > 1) {
     const s = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px'}}, ...avail.map(k => el('option', {value: k}, MIN_APP[k])));
@@ -3564,24 +3573,6 @@ function minAeroForm(an, store, roles) {
     form.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px'}}, 'Approach you would plan to fly:', s));
   }
   return form;
-}
-function minSaaEditor(store) {
-  const det = el('details', {style: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '8px', padding: '8px 12px', marginTop: '10px'}});
-  det.appendChild(el('summary', {style: {cursor: 'pointer', fontWeight: '700', fontSize: '12px'}}, 'SAA OM Part 1 minima ' + (store.saa.configured ? '(entered)' : '(not entered)')));
-  det.appendChild(div({style: {fontSize: '11px', color: '#555', margin: '6px 0'}}, 'Type in what your Operations Manual says for each situation. "Add" is added to the minima of the approach you plan to fly; "lowest allowed" is a floor. Leave a box empty if the OM does not use it. These figures stay on this device.'));
-  MIN_ROLE_ORDER.forEach(r => {
-    const c = store.saa.roles[r] = store.saa.roles[r] || {};
-    const row = div({style: {display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '6px'}}, el('span', {style: {fontSize: '12px', width: '140px', fontWeight: '600'}}, MIN_ROLES[r].label));
-    const mk = (key, ph) => minNumInput(c[key], ph, v => { c[key] = v; minSave(store); }, '86px');
-    if (r !== 'dep') row.appendChild(mk('addC', 'add ft')); row.appendChild(mk('addV', 'add m'));
-    if (r !== 'dep') row.appendChild(mk('floorC', 'lowest ceil ft')); row.appendChild(mk('floorV', 'lowest vis m'));
-    det.appendChild(row);
-  });
-  const done = btn({style: {width: 'auto', background: store.saa.configured ? '#fff' : '#006B3F', color: store.saa.configured ? '#666' : '#FFB612', border: '1px solid #CED4DA', borderRadius: '6px', padding: '7px 14px', fontSize: '12px', cursor: 'pointer'},
-    onclick: () => { store.saa.configured = !store.saa.configured; minSave(store); render(); }}, store.saa.configured ? 'Mark as not entered' : 'I have entered the SAA figures - use them');
-  det.appendChild(done);
-  if (store.saa.configured) det.setAttribute('open', '');
-  return det;
 }
 function minCard(pack) {
   const store = minLoad(), p = pack.plan;
@@ -3597,7 +3588,6 @@ function minCard(pack) {
   card.appendChild(row);
   if (!store.rules) { card.appendChild(div({style: {fontSize: '12px', color: '#B26A00'}}, 'Select Part 91, Part 121 or SAA OM Part 1 to see the minima.')); return card; }
   card.appendChild(div({style: {fontSize: '11px', color: '#555', marginBottom: '8px'}}, MIN_RULES[store.rules].long));
-  if (store.rules === 'saa') card.appendChild(minSaaEditor(store));
   card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '2. Aerodromes in this plan'));
   const out = minAnalysePack(pack, store);
   pack.stations.forEach(an => {
@@ -3639,7 +3629,12 @@ function minCard(pack) {
   card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '3. Alternates required'));
   if (!out.advice.length) card.appendChild(div({style: {fontSize: '12px', color: '#555'}}, 'Enter the approach minima above to see whether the plan has enough alternates.'));
   out.advice.forEach(a => card.appendChild(dpxFindingRow({sev: a.sev, area: 'Alternates', text: a.text})));
-  card.appendChild(div({style: {fontSize: '10px', color: '#888', marginTop: '8px', lineHeight: '1.5'}}, 'Basis: ±1 h of ETA window and the alternate rules follow CAR 91.07.7 / 91.07.8 / 121.07.1. The alternate adjustments (precision → non-precision minima; non-precision +200 ft and +1000 m; circling → circling) are the commonly quoted SA-CATS 91.07.8 table - confirm against the current SA-CATS 91 and your operator\'s approved minima. TEMPO/INTER periods are shown as cautions; PROB under 40% is ignored (use judgment).'));
+  const note = {
+    part91: 'Basis: CAR 91.07.5 / 91.07.7 / 91.07.8 and SA-CATS 91 TS 91.07.8 Table 1 (alternates: Cat I uses the non-precision minima; non-precision MDH + 200 ft and + 1000 m; circling as published).',
+    part121: 'Basis: SA-CATS 121 TS 121.07.1(1) alternate table (increments depend on the alternate\'s facilities). Your operator\'s approved alternate criteria under 121.07.1(2) may differ.',
+    saa: 'Basis: SAA FOM (OM Part 1) Rev 21.1 ch 8.1.3.2.3 (take-off), 8.1.3.3.13 (Type A: + 400 ft / + 1500 m; Type B: DH + 200 ft / + 800 m; circling + 400 ft / + 1500 m). Higher minima published by the company, Jeppesen or the Nominated Person Flight Operations still apply.',
+  }[store.rules];
+  card.appendChild(div({style: {fontSize: '10px', color: '#888', marginTop: '8px', lineHeight: '1.5'}}, note + ' Planning window is 1 h before to 1 h after ETA. TEMPO/INTER are shown as cautions; PROB under 40% is ignored (use judgment). Take-off alternate distance limit: twin 1 h OEI (ETOPS up to 2 h), three/four-engine 2 h (FOM 8.1.3.2.1 and CAR 91.07.7).'));
   return card;
 }
 
