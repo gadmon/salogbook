@@ -28,7 +28,9 @@ Deno.serve(async (req) => {
   const secret = Deno.env.get("CRON_SECRET");
   if (!secret || req.headers.get("x-cron-secret") !== secret) return new Response("Forbidden", { status: 403 });
 
-  const pub = Deno.env.get("VAPID_PUBLIC_KEY"), priv = Deno.env.get("VAPID_PRIVATE_KEY");
+  // Keys are URL-safe base64: drop anything else (spaces, line breaks, quotes, "=") a copy-paste may have added.
+  const clean = (v?: string) => (v || "").replace(/[^A-Za-z0-9_-]/g, "");
+  const pub = clean(Deno.env.get("VAPID_PUBLIC_KEY")), priv = clean(Deno.env.get("VAPID_PRIVATE_KEY"));
   if (!pub || !priv) return new Response("VAPID keys are not set", { status: 500 });
   webpush.setVapidDetails(Deno.env.get("VAPID_SUBJECT") || "mailto:admin@example.com", pub, priv);
 
