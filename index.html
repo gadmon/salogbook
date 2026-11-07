@@ -3375,6 +3375,42 @@ function minLoad() {
 function minSave(s) { try { localStorage.setItem(MIN_LS, JSON.stringify(s)); } catch (e) { /* storage full or blocked */ } }
 const minNum = v => { const n = parseFloat(v); return isFinite(n) && n >= 0 ? n : null; };
 
+// SA-CATS 91 TS 91.07.5 lowest RVR/visibility tables (from the uploaded SA-CATS 91): CAT I, CAT II, non-precision, circling.
+const MIN_FAC = {full: 'Full approach lights (720 m+ HI/MI)', int: 'Intermediate (420-719 m)', basic: 'Basic (under 420 m, or LI lights)', nil: 'Nil / no approach lights'};
+const MIN_CATI = [[200, [550, 700, 800, 1000]], [250, [600, 700, 800, 1000]], [300, [650, 800, 900, 1200]], [99999, [800, 900, 1000, 1200]]];
+const MIN_NPA = {
+  full:  [[800, 800, 800, 1200], [900, 1000, 1000, 1400], [1000, 1200, 1200, 1600], [1200, 1400, 1400, 1800]],
+  int:   [[1000, 1100, 1200, 1400], [1200, 1300, 1400, 1600], [1400, 1500, 1600, 1800], [1500, 1500, 1800, 2000]],
+  basic: [[1200, 1300, 1400, 1600], [1300, 1400, 1600, 1800], [1500, 1500, 1800, 2000], [1500, 1500, 2000, 2000]],
+  nil:   [[1500, 1500, 1600, 1800], [1500, 1500, 1800, 2000], [1500, 1500, 2000, 2000], [1500, 1500, 2000, 2000]],
+};
+const MIN_CIRC = {v: [1500, 1600, 2400, 3600], h: [400, 500, 600, 700]};
+function minFloor(k, a, aero, cat) {
+  const ci = {A: 0, B: 1, C: 2, D: 3, E: 3}[cat || 'C'], fac = aero.lights || 'nil', h = a.h;
+  const facTxt = (aero.lights ? '' : ' (lights not chosen - nil assumed)');
+  if (k === 'circ') return {v: MIN_CIRC.v[ci], h: MIN_CIRC.h[ci], text: 'circling lowest for category ' + (cat || 'C') + ': ' + MIN_CIRC.h[ci] + ' ft, ' + MIN_CIRC.v[ci] + ' m'};
+  if (h == null) return null;
+  if (k === 'npa') { const r = h < 300 ? 0 : h < 450 ? 1 : h < 650 ? 2 : 3; const v = MIN_NPA[fac][r][ci]; return {v, text: 'SA-CATS 91.07.5 lowest RVR for MDH ' + h + ' ft, category ' + (cat || 'C') + ', ' + fac + ' lights: ' + v + ' m' + facTxt + (h < 250 ? ' (MDH below 250 ft is not normally allowed for non-precision)' : '')}; }
+  if (k === 'prec') {
+    if (aero.precCat === 'II') { const v = h <= 120 ? 300 : h <= 140 ? 400 : 450; return {v, text: 'SA-CATS 91.07.5 CAT II lowest RVR for DH ' + h + ' ft: ' + v + ' m (approval required)'}; }
+    const row = MIN_CATI.find(r => h <= r[0]); const v = row[1][{full: 0, int: 1, basic: 2, nil: 3}[fac]];
+    return {v, text: 'SA-CATS 91.07.5 CAT I lowest RVR for DH ' + h + ' ft, ' + fac + ' lights: ' + v + ' m' + facTxt};
+  }
+  return null;
+}
+// Entered chart figures combined with the lowest allowed by SA-CATS: the higher wins.
+function minEff(aero, store) {
+  const e = {...(aero || {})};
+  ['prec', 'npa', 'circ'].forEach(k => {
+    const a = (aero || {})[k];
+    if (!a || (a.h == null && a.v == null)) { delete e[k]; return; }
+    const f = minFloor(k, a, aero || {}, store && store.cat);
+    const o = {...a};
+    if (f) { if (a.v == null || a.v < f.v) o.v = f.v; if (f.h != null && (a.h == null || a.h < f.h)) o.h = f.h; o.note = f.text + (a.v != null && a.v >= f.v ? ' (your figure ' + a.v + ' m is higher, so it is used)' : ''); }
+    e[k] = o;
+  });
+  return e;
+}
 // Which approach the pilot plans to fly at this aerodrome.
 function minPlanned(aero) {
   aero = aero || {};
@@ -3393,7 +3429,7 @@ function minLanding(aero) {
 // Sources (uploaded documents): CATS 91 TS 91.07.8 Table 1; SA-CATS 121 TS 121.07.1 table;
 // SAA FOM (OM Part 1) Rev 21.1, 13 Feb 2026, ch 8.1.3.2 / 8.1.3.3.13 / 8.5.
 function minRequired(rules, role, aero, store) {
-  aero = aero || {};
+  aero = minEff(aero, store || {});
   const out = {ceil: null, vis: null, basis: [], missing: [], blocked: ''};
   if (!rules) { out.blocked = 'Choose the rules you are operating under first.'; return out; }
   if (role === 'dep') {
@@ -3407,6 +3443,7 @@ function minRequired(rules, role, aero, store) {
   if (!alt) {     // destination and take-off alternate: the landing minima themselves
     out.ceil = land.ceil; out.vis = land.vis;
     out.basis.push(land.kind === 'prec' ? 'precision approach: RVR/visibility (no ceiling requirement)' : MIN_APP[land.kind] + ': ceiling at or above MDH and visibility at or above the approach minimum');
+    if (aero[land.kind] && aero[land.kind].note) out.basis.push(aero[land.kind].note);
     return out;
   }
   if (rules === 'part91') {            // CATS 91 TS 91.07.8 Table 1
@@ -3433,6 +3470,7 @@ function minRequired(rules, role, aero, store) {
     else { out.ceil = land.dh + 200; out.vis = land.vis + 800; out.basis.push('SAA FOM 8.1.3.3.13: Type B approach (DH below 250 ft) - DH + 200 ft, RVR/VIS + 800 m'); }
   }
   if (out.ceil == null && land.kind === 'prec' && rules !== 'part91') out.missing.push('the DH of the approach');
+  if (aero[land.kind] && aero[land.kind].note) out.basis.push(aero[land.kind].note);
   return out;
 }
 
@@ -3535,7 +3573,7 @@ function minAnalysePack(pack, store) {
     // Can the plan go without a destination alternate?
     const key = p.dep + '-' + p.arr, na = (store.noalt || {})[key] || {};
     if (store.rules === 'saa') {
-      const land = minLanding(store.aero[dest.icao] || {});
+      const land = minLanding(minEff(store.aero[dest.icao] || {}, store));
       const dh = land && land.dh != null ? land.dh : 0;
       const ceil = Math.max(2000, land && land.kind === 'circ' ? dh + 500 : 0);
       const st = pack.stations.find(x => x.icao === dest.icao);
@@ -3576,14 +3614,22 @@ function minAeroForm(an, store, roles) {
       minNumInput(aero[k].h, k === 'prec' ? 'DH ft' : 'MDH ft', upd(v => { aero[k].h = v; })),
       minNumInput(aero[k].v, 'RVR/vis m', upd(v => { aero[k].v = v; }))));
   });
+  form.appendChild(div({style: {fontSize: '10px', color: '#666', margin: '0 0 6px'}}, 'RVR/vis can be left empty - the SA-CATS 91.07.5 lowest value for the height, category and lights is then used. If you type the chart figure, the higher of the two is used.'));
+  [1].forEach(() => {
+  });
   if (roles.includes('dep')) form.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '5px'}},
     el('span', {style: {fontSize: '12px', width: '130px'}}, 'Take-off RVR/vis'), minNumInput(aero.toVis, 'm', upd(v => { aero.toVis = v; }))));
+  const smallSel0 = null;
   const smallSel = (opts, cur, on) => { const x = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px', maxWidth: '100%'}}, ...opts.map(o => el('option', {value: o[0]}, o[1]))); x.value = cur; x.addEventListener('change', () => { on(x.value); minSave(store); render(); }); return x; };
+  form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'Approach lights at ' + an.icao + ' (SA-CATS 91.07.5 facilities):'),
+    smallSel([['', 'Not chosen (nil assumed)'], ...Object.keys(MIN_FAC).map(k => [k, MIN_FAC[k]])], aero.lights || '', v => { aero.lights = v || undefined; })));
+  if (aero.prec && (aero.prec.h != null || aero.prec.v != null)) form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, 'Precision approach is: ',
+    smallSel([['I', 'CAT I'], ['II', 'CAT II (approval needed)']], aero.precCat || 'I', v => { aero.precCat = v; })));
   if (store.rules === 'part121') form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'Alternate aerodrome facilities (TS 121.07.1):'),
     smallSel([['A', 'Not straight-in to two runway ends (+400 ft, +1500 m)'], ['B', 'Straight-in to different suitable runways (+200 ft, +800 m)'], ['C2', 'Two approaches, one CAT II (300 ft / RVR 1200)'], ['C3', 'Two approaches, one CAT III (200 ft / RVR 550)']], aero.fac || 'A', v => { aero.fac = v; })));
   if (store.rules === 'saa' && roles.includes('dep')) form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'SAA FOM take-off table (without LVTO approval):'),
     smallSel([['', 'Choose...'], ['500', 'Nil facilities, day: 500 m'], ['400', 'Centre line markings / edge or CL lights, day: 400 m'], ['400n', 'Night with end lights + edge/CL lights: 400 m']], aero.toVis === 500 ? '500' : (aero.toVis === 400 ? '400' : ''), v => { if (v) aero.toVis = parseInt(v, 10); })));
-  const avail = ['prec', 'npa', 'circ'].filter(k => aero[k] && aero[k].v != null);
+  const avail = ['prec', 'npa', 'circ'].filter(k => aero[k] && (aero[k].v != null || aero[k].h != null));
   if (avail.length > 1) {
     const s = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px'}}, ...avail.map(k => el('option', {value: k}, MIN_APP[k])));
     s.value = minPlanned(aero) || avail[0];
@@ -3606,6 +3652,9 @@ function minCard(pack) {
   card.appendChild(row);
   if (!store.rules) { card.appendChild(div({style: {fontSize: '12px', color: '#B26A00'}}, 'Select Part 91, Part 121 or SAA OM Part 1 to see the minima.')); return card; }
   card.appendChild(div({style: {fontSize: '11px', color: '#555', marginBottom: '8px'}}, MIN_RULES[store.rules].long));
+  { const cs = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px'}}, ...[['A', 'A (under 91 kt)'], ['B', 'B (91-120 kt)'], ['C', 'C (121-140 kt)'], ['D', 'D/E (141 kt+)']].map(o => el('option', {value: o[0]}, o[1])));
+    cs.value = store.cat || 'C'; cs.addEventListener('change', () => { store.cat = cs.value; minSave(store); render(); });
+    card.appendChild(div({style: {display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px', marginBottom: '8px'}}, 'Aeroplane approach category:', cs)); }
   card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '2. Aerodromes in this plan'));
   const out = minAnalysePack(pack, store);
   pack.stations.forEach(an => {
