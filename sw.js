@@ -1,5 +1,5 @@
 // SALOGBOOK Service Worker v4
-const CACHE_NAME = 'salogbook-v15';
+const CACHE_NAME = 'salogbook-v16';
 
 // External libraries the app has a hard dependency on just to boot (Supabase JS
 // creates the client at the top of index.html's script - if it fails to load,

@@ -1655,6 +1655,15 @@ const curEffTo = (f, night) => {
   const ldg = night ? (f.night_landings||0) : curMoves(f,'ldg');
   return to > 0 ? to : ldg;
 };
+// Variants that share one type rating are one type for currency: A330 = A332/A333/A338/A339; A340 = A342/A343/A345/A346;
+// A320 family = A318-A321 (incl. neo). Anything else is its own type.
+function curTypeFamily(code) {
+  const c = String(code || '').toUpperCase().trim().replace(/[\s-]+/g, '');
+  if (/^A33[0-9]|^A330/.test(c) || /^A330/.test(c)) return 'A330';
+  if (/^A34[0-9]/.test(c)) return 'A340';
+  if (/^A3(18|19|20|21)|^A(19|20|21)N/.test(c)) return 'A320';
+  return String(code || '').trim();
+}
 const curDaysBetween = (a, b) => Math.floor((a - b) / CUR_DAY_MS);
 const curParse = s => s ? new Date(s.length === 10 ? s + 'T00:00:00' : s) : null;
 
@@ -1703,8 +1712,8 @@ const CUR_RULES = {
   },
   af_a330: {
     type:'count', label:'A330/A340 landing', reg:'Part 121 ops', window:90, required:1,
-    note:'At least 1 landing in either A330 (A333) or A340 (A343/A346) in the preceding 90 days.',
-    filter:f => ['A333','A343','A346'].some(t => (f.aircraft_type||'').includes(t)),
+    note:'At least 1 landing in either the A330 (any variant, e.g. A333) or the A340 (any variant, e.g. A343/A346) in the preceding 90 days.',
+    filter:f => ['A330','A340'].includes(curTypeFamily(f.aircraft_type)),
     val:f => curMoves(f,'ldg'),
   },
   af_apch_total: {
@@ -1881,7 +1890,7 @@ function curPerType(flights, now) {
   const cut365 = new Date(now.getTime() - 365 * CUR_DAY_MS);
   const types = {};
   flights.filter(f => !curIsSimOnly(f) && f.aircraft_type && curParse(f.date) >= cut365).forEach(f => {
-    const t = f.aircraft_type;
+    const t = curTypeFamily(f.aircraft_type);
     if (!types[t]) types[t] = {type:t, day:0, night:0, last:f.date, flights:[]};
     if (f.date > types[t].last) types[t].last = f.date;
     types[t].flights.push(f);
@@ -3689,7 +3698,7 @@ function dpxPreDeparture(pack) {
   }
   // 2. this aircraft type
   if (p.acType) {
-    const code = p.acType.split(' ')[0], pt = curPerType(state.flights, at).find(t => t.type === code || t.type.startsWith(code) || code.startsWith(t.type));
+    const code = curTypeFamily(p.acType.split(' ')[0]), pt = curPerType(state.flights, at).find(t => t.type === code);
     if (!pt) rows.push({sev: 'warn', area: code, text: 'No logged flights on ' + code + ' in the last 12 months. Check your type recency and any simulator/check requirements.'});
     else if (pt.day < 3) rows.push({sev: 'warn', area: code, text: 'Only ' + pt.day + ' take-off/landing' + (pt.day === 1 ? '' : 's') + ' logged on ' + code + ' in the last 90 days (3 needed for passenger-carrying day currency; verify against your operator\'s rules). Last flown ' + fmtDate(pt.last) + '.'});
     else rows.push({sev: 'ok', area: code, text: pt.day + ' day take-offs/landings in the last 90 days on ' + code + (pt.night ? ', ' + pt.night + ' night' : ', none at night') + '. Last flown ' + fmtDate(pt.last) + '.'});
