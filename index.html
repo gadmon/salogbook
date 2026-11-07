@@ -1648,6 +1648,13 @@ const curIsSimOnly = f => (f.total_time||0) === 0 && (f.sim_time||0) > 0;
 const curMoves = (f, kind) => kind === 'to'
   ? (f.day_takeoffs||0) + (f.night_takeoffs||0)
   : (f.day_landings||0) + (f.night_landings||0);
+// A flight that landed must have taken off. Many pilots log only the landings, so where a flight has
+// landings but no take-offs recorded, the take-offs are taken to equal the landings.
+const curEffTo = (f, night) => {
+  const to = night ? (f.night_takeoffs||0) : curMoves(f,'to');
+  const ldg = night ? (f.night_landings||0) : curMoves(f,'ldg');
+  return to > 0 ? to : ldg;
+};
 const curDaysBetween = (a, b) => Math.floor((a - b) / CUR_DAY_MS);
 const curParse = s => s ? new Date(s.length === 10 ? s + 'T00:00:00' : s) : null;
 
@@ -1672,7 +1679,8 @@ const CUR_RULES = {
     type:'count', label:'Passengers - day', reg:'CAR 61.01.8', window:90, required:3, realOnly:true,
     note:'3 take-offs and landings in the preceding 90 days to carry passengers. SACAA requires these in the same category/class (or type) - see the per-type breakdown below.',
     verify:true,
-    val:f => Math.min(curMoves(f,'to'), curMoves(f,'ldg')),
+    val:f => Math.min(curEffTo(f,false), curMoves(f,'ldg')),
+    explain:pool => pool.reduce((a,f) => a + curMoves(f,'ldg'), 0) + ' landings, ' + pool.reduce((a,f) => a + curEffTo(f,false), 0) + ' take-offs counted (day and night)',
     // Counting the smaller of take-offs and landings per flight keeps a flight
     // with 2 landings and 0 take-offs (a data-entry slip) from over-counting.
   },
@@ -1680,7 +1688,8 @@ const CUR_RULES = {
     type:'count', label:'Passengers - night', reg:'CAR 61.01.8', window:90, required:3, realOnly:true,
     note:'3 night take-offs and landings in the preceding 90 days to carry passengers at night. Requires a valid night rating.',
     verify:true,
-    val:f => Math.min(f.night_takeoffs||0, f.night_landings||0),
+    val:f => Math.min(curEffTo(f,true), f.night_landings||0),
+    explain:pool => pool.reduce((a,f) => a + (f.night_landings||0), 0) + ' night landings, ' + pool.reduce((a,f) => a + curEffTo(f,true), 0) + ' night take-offs counted',
   },
   af_to: {
     type:'count', label:'Take-offs (day or night)', reg:'Part 121 ops', window:90, required:3,
@@ -1837,7 +1846,7 @@ function curEvaluate(ruleIds, flights, endorsements, profile, now) {
       item.current = cur; item.required = r.required;
       item.daysLeft = cur >= r.required ? curDaysToLapse(pool, r.val, r.required, r.window, now) : null;
       item.status = cur < r.required ? 'bad' : (item.daysLeft !== null && item.daysLeft <= 14 ? 'warn' : 'ok');
-      item.detail = cur + ' / ' + r.required + ' in last ' + r.window + ' days';
+      item.detail = cur + ' / ' + r.required + ' in last ' + r.window + ' days' + (r.explain ? ' - ' + r.explain(pool) : '');
     } else if (r.type === 'since') {
       const ev = r.find(endorsements, profile);
       if (!ev || !ev.date) { item.status = 'none'; item.detail = 'Not recorded'; }
@@ -2005,6 +2014,7 @@ function curSummaryCard(items) {
 }
 
 function curPerTypeCard() {
+  try { if (/^airline/.test(curPrefs().profileId)) return null; } catch (e) {}
   const rows = curPerType(state.flights, new Date());
   if (!rows.length) return null;
   const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderLeft:'5px solid #0D6E6E', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}},
@@ -2415,7 +2425,7 @@ function brfAnalyse(data, opts) {
   const rank = {bad:0, warn:1, info:2};
   merged.sort((a, b) => rank[a.sev] - rank[b.sev]);
   return {
-    icao: data.icao, role: data.role, metar, taf, flags: merged,
+    icao: data.icao, role: data.role, metarRaw: data.metarRaw, metar, taf, flags: merged,
     category: metar ? brfCategory(metar.vis_m, metar.ceiling_ft) : null,
     worst: merged.some(f => f.sev === 'bad') ? 'bad' : (merged.some(f => f.sev === 'warn') ? 'warn' : 'ok'),
   };
@@ -4004,6 +4014,19 @@ const MIN_NPA = {
   nil:   [[1500, 1500, 1600, 1800], [1500, 1500, 1800, 2000], [1500, 1500, 2000, 2000], [1500, 1500, 2000, 2000]],
 };
 const MIN_CIRC = {v: [1500, 1600, 2400, 3600], h: [400, 500, 600, 700]};
+// SA-CATS 91.07.5 section 8: converting reported meteorological visibility to RVR. Not used for take-off minima,
+// CAT II/III, or when an RVR is reported. Factors [day, night]; null = no conversion allowed (no lights at night).
+const MIN_RVRF = {
+  hi:    {label: 'HI approach and runway lighting', f: [1.5, 2]},
+  other: {label: 'Any other type of lighting installation', f: [1, 1.5]},
+  none:  {label: 'No lighting', f: [1, null]},
+};
+// Returns {f, text} for the aerodrome, or null if the lights were not chosen (visibility is then used as it is).
+function minConv(aero) {
+  const c = MIN_RVRF[aero && aero.rwyLights]; if (!c) return null;
+  const night = !!aero.night, f = c.f[night ? 1 : 0];
+  return {f, night, label: c.label};
+}
 function minFloor(k, a, aero, cat) {
   const ci = {A: 0, B: 1, C: 2, D: 3, E: 3}[cat || 'C'], fac = aero.lights || 'nil', h = a.h;
   const facTxt = (aero.lights ? '' : ' (lights not chosen - nil assumed)');
@@ -4078,6 +4101,7 @@ function minRequired(rules, role, aero, store) {
   }
   const land = minLanding(aero);
   if (!land) { out.missing.push('the minima of the approach you would fly'); return out; }
+  if ((land.kind === 'npa' || (land.kind === 'prec' && aero.precCat !== 'II')) && minConv(aero)) out.conv = minConv(aero);
   const alt = role === 'destalt' || role === 'era';
   if (!alt) {     // destination and take-off alternate: the landing minima themselves
     out.ceil = land.ceil; out.vis = land.vis;
@@ -4145,15 +4169,22 @@ function minTafTimeline(taf) {
 // Compare the weather of one station with a requirement inside a window.
 function minEvaluate(an, req, win, includeMetar) {
   const rows = [];
-  const below = (vis, ceil) => {
+  const cv = req.conv || null;
+  const below = (vis, ceil, isRvr) => {
     const w = [];
-    if (req.vis != null && vis != null && vis < req.vis) w.push('visibility ' + brfFmtVis(vis) + ' < ' + req.vis + ' m');
+    if (req.vis != null && vis != null && cv && !isRvr) {      // SA-CATS 91.07.5 s8: met visibility -> RVR
+      if (cv.f == null) w.push('visibility ' + brfFmtVis(vis) + ' cannot be converted to RVR (' + cv.label + ' at night)');
+      else if (vis * cv.f < req.vis) w.push('visibility ' + brfFmtVis(vis) + (cv.f !== 1 ? ' x ' + cv.f + ' = ' + Math.round(vis * cv.f) + ' m RVR' : '') + ' < ' + req.vis + ' m');
+    } else if (req.vis != null && vis != null && vis < req.vis) w.push((isRvr ? 'RVR ' : 'visibility ') + brfFmtVis(vis) + ' < ' + req.vis + ' m');
     if (req.ceil != null && ceil != null && ceil < req.ceil) w.push('ceiling ' + ceil + ' ft < ' + req.ceil + ' ft');
     return w;
   };
   if (includeMetar && an.metar) {
     const m = an.metar, vis = m.cavok ? 9999 : m.vis_m, ceil = m.cavok ? null : m.ceiling_ft;
-    rows.push({label: 'METAR ' + (m.obsTime ? brfHHMM(m.obsTime) : ''), vis, ceil, soft: false, why: below(vis, ceil)});
+    // A reported RVR is used as it is (no conversion): lowest value of the R groups in the raw METAR.
+    const rv = [...String(an.metarRaw || '').matchAll(/\bR\d\d[LRC]?\/[PM]?(\d{4})/g)].map(x => +x[1]);
+    const rvr = rv.length ? Math.min(...rv) : null;
+    rows.push({label: 'METAR ' + (m.obsTime ? brfHHMM(m.obsTime) : ''), vis: rvr != null ? rvr : vis, ceil, soft: false, why: below(rvr != null ? rvr : vis, ceil, rvr != null)});
     m.trends.forEach(t => { const v = t.cavok ? 9999 : (t.vis_m != null ? t.vis_m : vis), c = t.cavok ? null : (t.clouds.length ? t.ceiling_ft : ceil); rows.push({label: 'METAR trend ' + t.kind, vis: v, ceil: c, soft: true, why: below(v, c)}); });
   }
   minTafTimeline(an.taf).forEach(r => {
@@ -4262,6 +4293,9 @@ function minAeroForm(an, store, roles) {
   const smallSel = (opts, cur, on) => { const x = sel({style: {padding: '5px', border: '1px solid #CED4DA', borderRadius: '5px', fontSize: '12px', maxWidth: '100%'}}, ...opts.map(o => el('option', {value: o[0]}, o[1]))); x.value = cur; x.addEventListener('change', () => { on(x.value); minSave(store); render(); }); return x; };
   form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'Approach lights at ' + an.icao + ' (SA-CATS 91.07.5 facilities):'),
     smallSel([['', 'Not chosen (nil assumed)'], ...Object.keys(MIN_FAC).map(k => [k, MIN_FAC[k]])], aero.lights || '', v => { aero.lights = v || undefined; })));
+  form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'Visibility to RVR conversion (SA-CATS 91.07.5 s8, landing only - not for take-off, CAT II/III or a reported RVR):'),
+    smallSel([['', 'Not chosen (visibility used as it is)'], ...Object.keys(MIN_RVRF).map(k => [k, MIN_RVRF[k].label])], aero.rwyLights || '', v => { aero.rwyLights = v || undefined; }),
+    smallSel([['', 'Landing by day'], ['n', 'Landing at night']], aero.night ? 'n' : '', v => { aero.night = v === 'n' ? true : undefined; })));
   if (aero.prec && (aero.prec.h != null || aero.prec.v != null)) form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, 'Precision approach is: ',
     smallSel([['I', 'CAT I'], ['II', 'CAT II (approval needed)']], aero.precCat || 'I', v => { aero.precCat = v; })));
   if (store.rules === 'part121') form.appendChild(div({style: {marginBottom: '5px', fontSize: '12px'}}, div({}, 'Alternate aerodrome facilities (TS 121.07.1):'),
