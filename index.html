@@ -3369,8 +3369,8 @@ const MIN_ROLE_ORDER = ['dep', 'tkoalt', 'era', 'dest', 'destalt'];
 const MIN_APP = {prec: 'Precision (ILS CAT I)', npa: 'Non-precision', circ: 'Circling'};
 
 function minLoad() {
-  try { const s = JSON.parse(localStorage.getItem(MIN_LS) || 'null'); if (s && typeof s === 'object') return {rules: '', aero: {}, tko: {}, saa: {configured: false, roles: {}}, ...s}; } catch (e) { /* ignore corrupt */ }
-  return {rules: '', aero: {}, tko: {}, saa: {configured: false, roles: {}}};
+  try { const s = JSON.parse(localStorage.getItem(MIN_LS) || 'null'); if (s && typeof s === 'object') return {rules: '', aero: {}, tko: {}, noalt: {}, saa: {configured: false, roles: {}}, ...s}; } catch (e) { /* ignore corrupt */ }
+  return {rules: '', aero: {}, tko: {}, noalt: {}, saa: {configured: false, roles: {}}};
 }
 function minSave(s) { try { localStorage.setItem(MIN_LS, JSON.stringify(s)); } catch (e) { /* storage full or blocked */ } }
 const minNum = v => { const n = parseFloat(v); return isFinite(n) && n >= 0 ? n : null; };
@@ -3503,12 +3503,14 @@ function minRolesFor(st, plan, store) {
   if ((store.tko || {})[plan.dep + '-' + plan.arr] === st.icao) out.push('tkoalt');
   return out;
 }
-function minWindow(role, plan, an) {
+function minWindow(role, plan, an, rules) {
   const m = x => new Date(x.getTime());
   const add = (d, mm) => new Date(d.getTime() + mm * 60000);
   if (role === 'dep') return {from: add(plan.etd, -30), to: add(plan.etd, 30)};
   if (role === 'tkoalt') return {from: add(plan.etd, -60), to: add(plan.etd, 120)};
   if (role === 'dest' || role === 'destalt') return {from: add(plan.eta, -60), to: add(plan.eta, 60)};
+  const e = (plan.etps || []).find(x => x.icao === an.icao);
+  if (e) return rules === 'saa' ? {from: e.from, to: add(e.to, 60)} : {from: add(e.from, -60), to: add(e.to, 60)};   // SAA FOM 8.5.1.7.3: earliest landing to 1 h after latest
   return an.window ? {from: an.window.from, to: an.window.to} : {from: plan.etd, to: plan.eta};
 }
 function minAnalysePack(pack, store) {
@@ -3517,7 +3519,7 @@ function minAnalysePack(pack, store) {
     minRolesFor(an, p, store).forEach(role => {
       const aero = store.aero[an.icao] || {};
       const req = minRequired(store.rules, role, aero, store);
-      const win = minWindow(role, p, an);
+      const win = minWindow(role, p, an, store.rules);
       const ev = (!req.blocked && !req.missing.length) ? minEvaluate(an, req, win, role === 'dep') : null;
       res.push({icao: an.icao, name: an.name, role, req, win, ev});
     });
@@ -3530,6 +3532,22 @@ function minAnalysePack(pack, store) {
     if (dest.ev.verdict === 'bad' || (dest.ev.verdict === 'warn' && /No forecast|No TAF/.test(dest.ev.text))) {
       advice.push({sev: nAlt >= 2 ? 'warn' : 'bad', text: 'The destination is not shown to be at or above planning minima (' + dest.ev.text + ') - two destination alternates are required (CAR 91.07.7(10) for Part 91, CAR 121.07.1(4) for Part 121). The plan has ' + nAlt + '.'});
     } else advice.push({sev: 'ok', text: 'Destination forecast is at or above planning minima, so one destination alternate satisfies the number-of-alternates rule (the plan has ' + nAlt + ').'});
+    // Can the plan go without a destination alternate?
+    const key = p.dep + '-' + p.arr, na = (store.noalt || {})[key] || {};
+    if (store.rules === 'saa') {
+      const land = minLanding(store.aero[dest.icao] || {});
+      const dh = land && land.dh != null ? land.dh : 0;
+      const ceil = Math.max(2000, land && land.kind === 'circ' ? dh + 500 : 0);
+      const st = pack.stations.find(x => x.icao === dest.icao);
+      const ev = st ? minEvaluate(st, {vis: 5000, ceil}, dest.win, false) : null;
+      const okTime = p.eteMin && p.eteMin <= 360;
+      const parts = [(okTime ? '✓' : '✗') + ' flight time ' + (p.eteMin ? Math.floor(p.eteMin / 60) + 'h' + String(p.eteMin % 60).padStart(2, '0') : '?') + ' (6 h or less)', (na.rwy ? '✓' : '✗') + ' two separate runways usable (you confirm)', (ev && ev.verdict === 'ok' ? '✓' : '✗') + ' ceiling at least ' + ceil + ' ft and visibility at least 5 km, ETA ±1 h'];
+      const all = okTime && na.rwy && ev && ev.verdict === 'ok';
+      advice.push({sev: all ? 'info' : 'info', text: 'SAA FOM 8.1.3.3.13 - flight without a destination alternate: ' + parts.join('; ') + '. ' + (all ? 'All conditions are met, so a destination alternate is not required (company approval and the commander\'s decision still apply).' : 'Not all are met, so plan at least one destination alternate.')});
+    } else {
+      const all = na.vmc && na.rwy;
+      advice.push({sev: 'info', text: 'CAR 91.07.7(6) - no destination alternate only if you are reasonably certain of VMC approach and landing, AND separate runways are usable with at least one instrument approach. ' + (all ? 'You have confirmed both, so one alternate is not required by this rule.' : 'Not confirmed - plan at least one destination alternate.')});
+    }
   } else if (dest) advice.push({sev: 'info', text: 'Destination minima cannot be checked yet - ' + (dest.req.blocked || ('enter ' + dest.req.missing.join(', '))) + '.'});
   if (dep && dep.ev) {
     const tko = res.some(r => r.role === 'tkoalt');
@@ -3629,6 +3647,13 @@ function minCard(pack) {
   card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', margin: '12px 0 6px'}}, '3. Alternates required'));
   if (!out.advice.length) card.appendChild(div({style: {fontSize: '12px', color: '#555'}}, 'Enter the approach minima above to see whether the plan has enough alternates.'));
   out.advice.forEach(a => card.appendChild(dpxFindingRow({sev: a.sev, area: 'Alternates', text: a.text})));
+  if (out.rows.some(r => r.role === 'dest')) {
+    const nk = p.dep + '-' + p.arr; store.noalt = store.noalt || {}; const na = store.noalt[nk] = store.noalt[nk] || {};
+    const chk = (key, label) => { const cb = el('input', {type: 'checkbox', style: {width: '16px', height: '16px', marginRight: '6px'}}); cb.checked = !!na[key]; cb.addEventListener('change', () => { na[key] = cb.checked; minSave(store); render(); }); return el('label', {style: {display: 'flex', alignItems: 'center', fontSize: '11px', color: '#555', marginTop: '4px', cursor: 'pointer'}}, cb, label); };
+    card.appendChild(div({style: {fontWeight: '700', fontSize: '11px', margin: '8px 0 2px'}}, 'Only if you are considering no destination alternate - you confirm:'));
+    card.appendChild(chk('rwy', store.rules === 'saa' ? 'Two separate runways are usable at the destination' : 'Separate runways are usable at the destination, at least one with an instrument approach'));
+    if (store.rules !== 'saa') card.appendChild(chk('vmc', 'I am reasonably certain of a VMC approach and landing at the destination at the time of use'));
+  }
   const note = {
     part91: 'Basis: CAR 91.07.5 / 91.07.7 / 91.07.8 and SA-CATS 91 TS 91.07.8 Table 1 (alternates: Cat I uses the non-precision minima; non-precision MDH + 200 ft and + 1000 m; circling as published).',
     part121: 'Basis: SA-CATS 121 TS 121.07.1(1) alternate table (increments depend on the alternate\'s facilities). Your operator\'s approved alternate criteria under 121.07.1(2) may differ.',
