@@ -1711,13 +1711,24 @@ const CUR_PROFILES = {
   ppl:     {label:'PPL - private pilot',            rules:['medical','skills_test','class_rating','pax_day']},
   ppl_night:{label:'PPL + night rating',            rules:['medical','skills_test','class_rating','night_rating','pax_day','pax_night']},
   ppl_ir:  {label:'PPL + night + instrument rating', rules:['medical','skills_test','class_rating','night_rating','ir','pax_day','pax_night']},
-  cpl:     {label:'CPL / instructor / charter',      rules:['medical','skills_test','class_rating','night_rating','ir','pax_day','pax_night','opc']},
-  airline: {label:'Airline (Part 121) - SAA style',  rules:['medical','opc','af_to','af_ldg','af_a330','af_apch_total','af_apch_prec','af_rnp','af_cat23']},
+  cpl:     {label:'Part 135 / commercial - charter or instructor (CPL)', rules:['medical','skills_test','class_rating','night_rating','ir','pax_day','pax_night','opc']},
+  airline_other: {label:'Airline (Part 121) - other operator', rules:['medical','opc','af_to','af_ldg','af_apch_total']},
+  airline: {label:'Airline (Part 121) - SAA A330/A340',  rules:['medical','opc','af_to','af_ldg','af_a330','af_apch_total','af_apch_prec','af_rnp','af_cat23']},
 };
+// What kind of flying the pilot does. Chosen once; decides which currency items, minima rules and
+// airline-only items (OPC/PPC, fleet currency) are shown at all.
+const CUR_OPS = [
+  {id:'ppl',           group:'Part 91 - private / recreational flying', title:'PPL - day VFR',                 minima:'part91',  hint:'Medical, licence/skills test, class rating, passenger currency by day.'},
+  {id:'ppl_night',     group:'Part 91 - private / recreational flying', title:'PPL + night rating',            minima:'part91',  hint:'As above plus night rating and night passenger currency.'},
+  {id:'ppl_ir',        group:'Part 91 - private / recreational flying', title:'PPL + night + instrument rating', minima:'part91', hint:'As above plus instrument rating validity.'},
+  {id:'cpl',           group:'Part 135 / commercial (not an airline)',  title:'Charter, instructor or other commercial CPL flying', minima:'part91', hint:'Adds the proficiency check (OPC/LPC) on top of the private-flying items.'},
+  {id:'airline_other', group:'Airline - Part 121',                      title:'Airline pilot (not SAA)',       minima:'part121', hint:'Medical, OPC/PPC, take-offs, landings and approaches. No fleet-specific items.'},
+  {id:'airline',       group:'Airline - Part 121',                      title:'SAA A330 / A340',               minima:'saa',     hint:'Includes the A330/A340 landing currency, RNP and CAT II/III approaches.'},
+];
 
 function curDefaultProfileId(profile) {
   const t = profile && profile.licence_type;
-  if (t === 'ATPL') return 'airline';
+  if (t === 'ATPL') return 'airline_other';
   if (t === 'CPL') return 'cpl';
   return 'ppl_night';
 }
@@ -1846,6 +1857,27 @@ function curSetPrefs(p) {
   curSavePrefs(state.session.user.id, p);
   render();
 }
+// True until the pilot has told us what kind of flying they do (nothing saved on this device yet).
+function curNeedsSetup() {
+  try { return !localStorage.getItem('salogbook_cur_prefs_' + state.session.user.id); } catch (e) { return false; }
+}
+function curChooseOp(id) {
+  const op = CUR_OPS.find(o => o.id === id); if (!op) return;
+  const ms = minLoad(); ms.rules = op.minima; minSave(ms);
+  curSetPrefs({profileId:id, off:[], on:[]});
+}
+function curSetupCard() {
+  const card = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderLeft:'6px solid #006B3F', borderRadius:'10px', padding:'16px 18px', marginBottom:'14px'}});
+  card.appendChild(div({style:{fontWeight:'800', fontSize:'16px', marginBottom:'4px'}}, 'What kind of flying do you do?'));
+  card.appendChild(div({style:{fontSize:'12px', color:'#555', marginBottom:'12px', lineHeight:'1.5'}}, 'Pick one so the app only shows what applies to you. Airline items such as OPC/PPC and type-specific landings are hidden unless you fly for an airline. You can change this any time under "My currency profile".'));
+  let lastGroup = null;
+  CUR_OPS.forEach(o => {
+    if (o.group !== lastGroup) { card.appendChild(div({style:{fontWeight:'700', fontSize:'11px', color:'#006B3F', textTransform:'uppercase', letterSpacing:'.5px', margin:'10px 0 5px'}}, o.group)); lastGroup = o.group; }
+    card.appendChild(btn({style:{display:'block', width:'100%', textAlign:'left', background:'#F8F9FA', border:'1px solid #CED4DA', borderRadius:'8px', padding:'10px 14px', marginBottom:'6px', cursor:'pointer'}, onclick:() => curChooseOp(o.id)},
+      div({style:{fontWeight:'700', fontSize:'13px', color:'#1A1A1A'}}, o.title), div({style:{fontSize:'11px', color:'#666', marginTop:'2px'}}, o.hint)));
+  });
+  return card;
+}
 function curItems() {
   return curEvaluate(curActiveRuleIds(curPrefs()), state.flights, state.endorsements, state.profile, new Date());
 }
@@ -1961,7 +1993,7 @@ function curPickerCard() {
 
 // Header strip shown on every tab when something needs attention
 function curBanner() {
-  if (!state.session || state.tab === 'now') return null;
+  if (!state.session || state.tab === 'now' || curNeedsSetup()) return null;
   const items = curItems();
   const s = curSummary(items);
   if (!s.bad.length && !s.warn.length) return null;
@@ -3740,7 +3772,7 @@ function minCard(pack) {
   card.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '10px'}}, 'Which minima apply at take-off, the alternates and the destination, and whether the weather in the pack meets them. Advisory only - the minima in your approved documents and the decision stay with you.'));
   card.appendChild(div({style: {fontWeight: '700', fontSize: '12px', marginBottom: '6px'}}, '1. Which rules are you operating under?'));
   const row = div({style: {display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px'}});
-  Object.keys(MIN_RULES).forEach(k => {
+  Object.keys(MIN_RULES).filter(k => k !== 'saa' || curPrefs().profileId === 'airline' || store.rules === 'saa').forEach(k => {
     const on = store.rules === k;
     row.appendChild(btn({style: {width: 'auto', background: on ? '#006B3F' : '#fff', color: on ? '#FFB612' : '#333', border: '1px solid ' + (on ? '#006B3F' : '#CED4DA'), borderRadius: '8px', padding: '8px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: () => { store.rules = k; minSave(store); render(); }}, MIN_RULES[k].label));
   });
@@ -4431,6 +4463,9 @@ function render() {
   // ── REPORTS TAB ────────────────────────────────────────────────────────────
 
   // ── RECENCY TAB ─────────────────────────────────────────────────────────────
+  else if (state.tab === 'now' && curNeedsSetup()) {
+    main.appendChild(curSetupCard());
+  }
   else if (state.tab === 'now') {
     const items = curItems();
     main.appendChild(div({style:{marginBottom:'12px'}},
@@ -4559,7 +4594,7 @@ function render() {
         span({style:{fontSize:'11px',color:'var(--steel)'}},'OPC / LPC / PPC, Instrument Rating (IF) and Type / Class Rating')
       ));
       const revalWrap = div({style:{background:'var(--card)',border:'2px solid var(--amber)44',borderRadius:'10px',padding:'14px 16px',marginBottom:'16px'}});
-      [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF],['Type / Class Rating',latestTypeRating]].forEach(([label,e])=>{
+      [['OPC / LPC / PPC',latestOpcLpcPpc],['Instrument Rating (IF Revalidation)',latestIF],['Type / Class Rating',latestTypeRating]].filter(r=>r[0]!=='OPC / LPC / PPC'||['cpl','airline_other','airline'].includes(curPrefs().profileId)||r[1]).forEach(([label,e])=>{
         const row = div({style:{display:'flex',gap:'12px',padding:'8px 0',borderBottom:'1px solid var(--border)22',fontSize:'12px',flexWrap:'wrap',alignItems:'center'}});
         row.appendChild(span({style:{color:'var(--sky)',minWidth:'190px',fontWeight:'700'}},label));
         if (e) {
