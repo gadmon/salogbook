@@ -4756,6 +4756,7 @@ function nbRender(main) {
   }
 }
 
+let TAB_SCROLL = null;     // horizontal scroll of the tab bar, kept across re-renders
 function render() {
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -4825,8 +4826,13 @@ function render() {
     tabs.appendChild(b);
   });
   header.appendChild(tabs);
+  tabs.addEventListener('scroll', () => { TAB_SCROLL = tabs.scrollLeft; try { sessionStorage.setItem('salogbook_tabscroll', String(TAB_SCROLL)); } catch (e) {} }, {passive: true});
   const curBn = curBanner(); if (curBn) header.appendChild(curBn);
   app.appendChild(header);
+  // render() rebuilds the page, which would snap the tab bar back to the left: put it back where it was.
+  if (TAB_SCROLL == null) { try { TAB_SCROLL = parseFloat(sessionStorage.getItem('salogbook_tabscroll')); } catch (e) {} }
+  if (isFinite(TAB_SCROLL) && TAB_SCROLL != null) tabs.scrollLeft = TAB_SCROLL;
+  else { const a = tabs.querySelector('.tab.active'); if (a && a.scrollIntoView) a.scrollIntoView({inline: 'center', block: 'nearest'}); }
 
   const main = div({class:'main'});
 
