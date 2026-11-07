@@ -268,6 +268,7 @@ function getCachedIdentity() {
 let _authSettled = false;
 sb.auth.onAuthStateChange(async (event, session) => {
   _authSettled = true;
+  if (event === 'PASSWORD_RECOVERY') state.recovery = true;
   if (session) {
     state.session = session;
     cacheLastIdentity(session);
@@ -368,9 +369,27 @@ async function signIn(email, password) {
   if (error) throw error;
 }
 
+// The confirmation / reset link in the email brings the pilot back to this page.
+const AUTH_RETURN = () => location.origin + location.pathname;
 async function signUp(email, password, fullName) {
-  const { error } = await sb.auth.signUp({ email, password, options: { data: { full_name: fullName } } });
+  const { data, error } = await sb.auth.signUp({ email, password, options: { data: { full_name: fullName }, emailRedirectTo: AUTH_RETURN() } });
   if (error) throw error;
+  // Supabase hides "this email is already registered" by returning a user with no identities
+  if (data && data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) throw new Error('That email is already registered. Sign in instead, or use "Forgot password?".');
+  return data;
+}
+async function resendConfirmation(email) {
+  const { error } = await sb.auth.resend({ type: 'signup', email, options: { emailRedirectTo: AUTH_RETURN() } });
+  if (error) throw error;
+}
+async function sendPasswordReset(email) {
+  const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: AUTH_RETURN() });
+  if (error) throw error;
+}
+// A signed-in user whose confirmation email was sent but never clicked (auto-confirmed accounts have no confirmation_sent_at).
+function authNeedsVerify(session) {
+  const u = session && session.user;
+  return !!(u && !session.offline && !u.email_confirmed_at && !u.confirmed_at && u.confirmation_sent_at);
 }
 
 async function signOut() {
@@ -929,6 +948,35 @@ function textInp(val, onChange, placeholder='') {
 }
 
 // ─── AUTH SCREEN ──────────────────────────────────────────────────────────────
+function authLinkBtn(label, onclick) { return el('button', {type:'button', style:{background:'none',border:'none',color:'var(--sky)',cursor:'pointer',fontSize:'12px',textDecoration:'underline',padding:'4px 6px'}, onclick}, label); }
+function authShell(...kids) {
+  const wrap = div({class:'auth-wrap'}), card = div({class:'auth-card'});
+  card.appendChild(div({class:'auth-logo'}, div({class:'auth-icon'},'SB'), div({}, div({class:'auth-title'},'SALOGBOOK'), div({class:'auth-sub'},'Springbok Aviation Logbook - SACAA Compliant'))));
+  kids.forEach(k => k && card.appendChild(k)); wrap.appendChild(card); return wrap;
+}
+function renderVerifyScreen() {
+  const email = state.session.user.email, msg = div({style:{fontSize:'12px',marginTop:'10px',minHeight:'16px'}});
+  const say = (t, ok) => { msg.textContent = t; msg.style.color = ok ? 'var(--green)' : 'var(--red)'; };
+  return authShell(
+    div({style:{fontSize:'14px',fontWeight:'800',marginBottom:'6px'}}, 'Confirm your email address'),
+    div({style:{fontSize:'12px',lineHeight:'1.6',color:'var(--steel)'}}, 'We sent a confirmation link to ' + email + '. Open it, then come back here. Check your spam folder if it is not in your inbox.'),
+    div({style:{display:'flex',gap:'8px',flexWrap:'wrap',marginTop:'14px'}},
+      btn({class:'btn btn-primary', style:{width:'auto',padding:'9px 16px'}, onclick: async () => { const { data } = await sb.auth.refreshSession(); if (data && data.session && data.session.user.email_confirmed_at) { state.session = data.session; render(); } else say('Not confirmed yet - open the link in the email first.', false); }}, 'I have confirmed'),
+      btn({class:'btn btn-secondary', style:{width:'auto',padding:'9px 16px'}, onclick: async () => { try { await resendConfirmation(email); say('Sent again to ' + email, true); } catch (x) { say(x.message, false); } }}, 'Resend email'),
+      btn({class:'btn btn-secondary', style:{width:'auto',padding:'9px 16px'}, onclick: () => sb.auth.signOut()}, 'Use another account')),
+    msg);
+}
+function renderRecoveryScreen() {
+  const pw = inp({type:'password', placeholder:'New password (6+ characters)', style:{width:'100%',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:'7px',padding:'9px 12px',color:'var(--text)',fontSize:'14px',marginTop:'8px'}});
+  const msg = div({style:{fontSize:'12px',marginTop:'10px'}});
+  return authShell(
+    div({style:{fontSize:'14px',fontWeight:'800',marginBottom:'4px'}}, 'Choose a new password'), pw,
+    btn({class:'btn btn-primary', style:{marginTop:'12px'}, onclick: async () => {
+      if (pw.value.length < 6) { msg.style.color = 'var(--red)'; msg.textContent = 'Use at least 6 characters.'; return; }
+      const { error } = await sb.auth.updateUser({ password: pw.value });
+      if (error) { msg.style.color = 'var(--red)'; msg.textContent = error.message; } else { state.recovery = false; toast('Password updated'); render(); }
+    }}, 'Save password'), msg);
+}
 function renderAuth() {
   const wrap = div({class:'auth-wrap'});
   const card = div({class:'auth-card'});
@@ -974,9 +1022,17 @@ function renderAuth() {
       submitBtn.textContent = 'Please wait...';
       try {
         if (isLogin) await signIn(email, pass);
-        else { await signUp(email, pass, name); errEl.className='ok'; errEl.textContent='Check your email to confirm your account.'; errEl.style.display='block'; }
+        else {
+          const r = await signUp(email, pass, name);
+          errEl.className = 'ok'; errEl.style.display = 'block';
+          errEl.textContent = r && r.session ? 'Account created.' : 'Almost there - we sent a confirmation link to ' + email + '. Open it on this device to finish creating your account. Check your spam folder if it does not arrive in a few minutes.';
+          if (!(r && r.session)) errEl.appendChild(authLinkBtn('Resend the email', async () => { try { await resendConfirmation(email); toast('Confirmation email sent'); } catch (x) { toast(x.message); } }));
+        }
       } catch(e) {
-        errEl.className='err'; errEl.textContent=e.message; errEl.style.display='block';
+        errEl.className='err'; errEl.style.display='block';
+        const unconfirmed = /not confirmed/i.test(e.message || '');
+        errEl.textContent = unconfirmed ? 'Your email address is not confirmed yet. Open the link we emailed you, or ask for a new one.' : (/invalid login/i.test(e.message || '') ? 'Wrong email or password.' : e.message);
+        if (unconfirmed) errEl.appendChild(authLinkBtn('Resend the email', async () => { try { await resendConfirmation(email); toast('Confirmation email sent'); } catch (x) { toast(x.message); } }));
       }
       submitBtn.disabled = false;
       submitBtn.textContent = isLogin ? 'Sign In' : 'Create Account';
@@ -990,6 +1046,13 @@ function renderAuth() {
   form.appendChild(errDiv);
   form.appendChild(submitBtn);
   form.appendChild(toggleBtn);
+  if (isLogin) form.appendChild(div({style:{textAlign:'center',marginTop:'8px'}}, authLinkBtn('Forgot password?', async () => {
+    const email = (document.getElementById('auth-email').value || '').trim(), errEl = document.getElementById('auth-err');
+    errEl.style.display = 'block';
+    if (!email) { errEl.className = 'err'; errEl.textContent = 'Type your email address above first.'; return; }
+    try { await sendPasswordReset(email); errEl.className = 'ok'; errEl.textContent = 'If that email has an account, a reset link is on its way.'; }
+    catch (x) { errEl.className = 'err'; errEl.textContent = x.message; }
+  })));
 
   const setup = div({style:{marginTop:'18px',padding:'14px',background:'var(--card)',borderRadius:'8px',border:'1px solid var(--border)'}});
   setup.innerHTML = '<div style="font-size:10px;color:var(--steel);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Setup Required</div>' +
@@ -4661,6 +4724,8 @@ function render() {
     app.appendChild(ld);
     return;
   }  if (!state.session) { app.appendChild(renderAuth()); return; }
+  if (state.recovery) { app.appendChild(renderRecoveryScreen()); return; }
+  if (authNeedsVerify(state.session)) { app.appendChild(renderVerifyScreen()); return; }
 
   const totals = computeTotals(state.flights);
   const filtered = filteredFlights();
