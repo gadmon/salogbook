@@ -2470,7 +2470,7 @@ function dpxLines(items) {
   }).filter(Boolean);
 }
 
-async function dpxExtractPages(pdfjsLib, data) {
+async function dpxExtractPages(pdfjsLib, data, noSplit) {
   const pdf = await pdfjsLib.getDocument({data}).promise;
   const pages = [];
   for (let p = 1; p <= pdf.numPages; p++) {
@@ -2478,7 +2478,7 @@ async function dpxExtractPages(pdfjsLib, data) {
     const vp = page.getViewport({scale: 1});
     const tc = await page.getTextContent();
     const items = tc.items.filter(i => i.str && i.str.trim()).map(i => ({str: i.str, x: i.transform[4], y: i.transform[5], w: i.width || 0}));
-    const split = dpxColumnSplit(items, vp.width);
+    const split = noSplit ? null : dpxColumnSplit(items, vp.width);
     const lines = split === null ? dpxLines(items)
       : [...dpxLines(items.filter(i => i.x < split)), ...dpxLines(items.filter(i => i.x >= split))];
     pages.push({n: p, lines, text: lines.join('\n'), twoCol: split !== null});
@@ -2494,6 +2494,7 @@ const DPX_ROLE_RE = /^(Departure|Destination|Alternate \d+|ETP Airport|Enroute a
 
 function dpxClassify(pages) {
   const all = pages.slice(0, 3).map(p => p.text).join('\n');
+  if (/PRE-FLIGHT INFORMATION BULLETIN/.test(all) && /AERONAUTICAL INFORMATION/.test(all)) return 'pib';
   if (/International Flight Folder/.test(all) && /METEOROLOGICAL DATA FOR FLIGHT/.test(all)) return 'weather';
   if (/^[A-Z]{4} . [A-Z]{4} \(\w{3} \d+, \d{4}\)/m.test(all) && /\bETD\b/.test(all)) return 'plan';
   return 'unknown';
@@ -2852,6 +2853,291 @@ function dpxNotamSeverity(n, isAerodromeOnRoute) {
   return ['info', 'Other'];
 }
 
+// ================= NOTAM BRIEFING (ATNS pre-flight information bulletin) =================
+// Reads the separate NOTAM PDF, decides which NOTAMs matter for THIS flight (aerodromes and FIRs
+// on the plan, the times you are there) and works out what they mean for the runway the wind
+// should put in use. Keyword rules - they point you at the right NOTAMs, they do not replace reading them.
+const PIB_CAT = 'AGA|ATM|CNS|NAV|OTH|COM|MET|SAR|AIS|SVC|ATS|RAC|FAL|LGT|MIL';
+const PIB_HEAD_RE = new RegExp('^(' + PIB_CAT + ')\\s+B\\)\\s*(\\d{10})\\s+C\\)\\s*(\\d{10}|PERM)?\\s*(EST|PERM)?\\s*\\(([A-Z]\\d{4}\\/\\d{2})\\)\\s*$');
+const PIB_FOOT_RE = /ATNS\s+\d+\/\d+\s*$/;
+
+function dpxIsPib(pages) {
+  const all = pages.slice(0, 2).map(p => p.text).join('\n');
+  return /PRE-FLIGHT INFORMATION BULLETIN/.test(all) && /AERONAUTICAL INFORMATION/.test(all);
+}
+
+function dpxParsePib(pages) {
+  const out = {notams: [], docs: [], adep: null, ades: null, alternates: [], firs: [], period: null, warnings: []};
+  const lines = [];
+  pages.forEach(p => p.lines.forEach(l => { l = l.replace(/\s+$/, ''); if (l && !PIB_FOOT_RE.test(l)) lines.push(l.trim()); }));
+  const first = pages[0] ? pages[0].lines.join(' ') : '';
+  let m = first.match(/Adep\s+([A-Z]{4})/); if (m) out.adep = m[1];
+  m = first.match(/Ades\s+([A-Z]{4})/); if (m) out.ades = m[1];
+  m = first.match(/ALTN AD\s+((?:[A-Z]{4}\s*)+)/); if (m) out.alternates = m[1].trim().split(/\s+/);
+  m = first.match(/Period\s+(\d{2}[A-Z]{3}\d{2} \d{4}) TO (\d{2}[A-Z]{3}\d{2} \d{4})/); if (m) out.period = [m[1], m[2]];
+  let section = null, lastAd = {}, cur = null, field = null, inDocs = false, docIcao = null, pendingRole = null;
+  const flush = () => { if (!cur) return; cur.text = (cur.e || '').replace(/\s+/g, ' ').trim(); cur.title = null; out.notams.push(cur); cur = null; field = null; };
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^NON NOTAM DOCUMENT INFORMATION/.test(l)) { flush(); inDocs = true; continue; }
+    if (inDocs) {
+      if (/^[A-Z]{4}$/.test(l)) { docIcao = l; continue; }
+      if (/^DOCUMENT:/.test(l)) { out.docs.push({icao: docIcao, name: l.replace(/^DOCUMENT:\s*/, ''), text: ''}); continue; }
+      if (/^END OF DOCUMENT/.test(l)) continue;
+      if (out.docs.length) out.docs[out.docs.length - 1].text += (out.docs[out.docs.length - 1].text ? ' ' : '') + l;
+      continue;
+    }
+    let mm;
+    if ((mm = l.match(/^(DEPARTURE|DESTINATION|ALTERNATE) AERODROME$/))) { flush(); pendingRole = mm[1][0] + mm[1].slice(1).toLowerCase(); continue; }
+    if ((mm = l.match(/^CYLINDER AROUND (DEPARTURE|DESTINATION|ALTERNATE) AERODROME$/))) { flush(); const r = mm[1][0] + mm[1].slice(1).toLowerCase(); section = {kind: 'cylinder', key: lastAd[r] || (section && section.key), role: r}; continue; }
+    if ((mm = l.match(/^FIR ([A-Z]{4}) \((.*)\)$/))) { flush(); section = {kind: 'fir', key: mm[1], name: mm[2]}; out.firs.push(mm[1]); continue; }
+    if (/^(AERODROME INFORMATION|EN-ROUTE FIR INFORMATION)$/.test(l)) { flush(); continue; }
+    if ((mm = l.match(/^([A-Z]{4}) \(([^)]*)\)?$/)) && (pendingRole || (!cur && /^[A-Z]{4} \([A-Z0-9 \/.,'&-]+\)?$/.test(l) && lines[i + 1] && (PIB_HEAD_RE.test(lines[i + 1]) || /^CYLINDER AROUND/.test(lines[i + 1]))))) {
+      flush(); const role = pendingRole || 'Alternate'; pendingRole = null; section = {kind: 'aerodrome', key: mm[1], role, name: mm[2]}; lastAd[role] = mm[1]; continue;
+    }
+    if (/^\([A-Z]\d{4}\/\d{2}\( NOTAM already displayed/.test(l)) { flush(); continue; }
+    if ((mm = l.match(PIB_HEAD_RE))) {
+      flush();
+      cur = {id: mm[5], category: mm[1], b: mm[2], c: mm[3] && /^\d/.test(mm[3]) ? mm[3] : null, est: mm[4] === 'EST', perm: mm[3] === 'PERM' || mm[4] === 'PERM',
+             section: section ? section.key : null, sectionKind: section ? section.kind : null, sectionName: section ? section.name : null, role: section ? section.role : null,
+             type: 'NOTAMN', d: null, e: '', f: null, g: null, loc: section ? section.key : null};
+      field = null; continue;
+    }
+    if (!cur) continue;
+    if ((mm = l.match(/^D\)\s*(.*)$/))) { cur.d = mm[1]; field = 'd'; continue; }
+    if ((mm = l.match(/^E\)\s*(.*)$/))) { cur.e = mm[1]; field = 'e'; continue; }
+    if ((mm = l.match(/^F\)\s*(.*?)\s*G\)\s*(.*)$/))) { cur.f = mm[1] || null; cur.g = mm[2] || null; field = null; continue; }
+    if ((mm = l.match(/^F\)\s*(.*)$/))) { cur.f = mm[1]; field = 'f'; continue; }
+    if ((mm = l.match(/^G\)\s*(.*)$/))) { cur.g = mm[1]; field = null; continue; }
+    if (field === 'd') cur.d += ' ' + l; else if (field === 'e') cur.e += ' ' + l;
+  }
+  flush();
+  // the same NOTAM is printed under the aerodrome, its cylinder and the FIR - keep the most specific copy
+  const rank = {aerodrome: 0, cylinder: 1, fir: 2}, seen = {};
+  out.notams.forEach(n => { const o = seen[n.id]; if (!o || rank[n.sectionKind] < rank[o.sectionKind]) seen[n.id] = n; });
+  const all = out.notams.length;
+  out.notams = Object.values(seen);
+  out.total = all;
+  if (!out.notams.length) out.warnings.push('No NOTAMs were found in this briefing');
+  return out;
+}
+
+// ---- runways ---------------------------------------------------------------------------
+function pibRecip(d) {
+  const n = +d.slice(0, 2), r = ((n + 17) % 36) + 1, s = d.slice(2);
+  return String(r).padStart(2, '0') + (s === 'L' ? 'R' : s === 'R' ? 'L' : s);
+}
+function pibRwys(text) {
+  const set = new Set();
+  const re = /\bRWYS?\s*((?:\d{2}[LRC]?(?:\s*[\/,&-]\s*|\s+AND\s+)?)+)/g; let m;
+  while ((m = re.exec(text))) (m[1].match(/\d{2}[LRC]?/g) || []).forEach(d => { if (+d.slice(0, 2) >= 1 && +d.slice(0, 2) <= 36) set.add(d); });
+  return Array.from(set);
+}
+// Runways we know for sure (verify against the AIP); anything else comes from the runways the briefing names.
+const PIB_RWY_DB = {FAOR: ['03L', '21R', '03R', '21L'], FACT: ['01', '19', '16', '34'], FALE: ['06', '24'], FALA: ['07', '25'], FAGG: ['11', '29'], FAPE: ['08', '26'], FVFA: ['06', '24']};
+function pibAeroEnds(notams, icao) {
+  const s = new Set(); notams.forEach(n => pibRwys((n.text || '').toUpperCase()).forEach(d => { s.add(d); s.add(pibRecip(d)); }));
+  (PIB_RWY_DB[icao] || []).forEach(d => s.add(d));
+  // a bare "RWY 03" next to "03L"/"03R" just means the pair - drop it
+  Array.from(s).forEach(d => { if (d.length === 2 && (s.has(d + 'L') || s.has(d + 'R') || s.has(d + 'C'))) s.delete(d); });
+  return Array.from(s).sort();
+}
+function pibWindAt(an, t) {
+  let w = null, src = '';
+  const taf = an && an.taf;
+  if (taf && taf.periods && t) {
+    const mains = taf.periods.filter(p => p.kind === 'BASE' || p.kind === 'FM' || p.kind === 'BECMG').slice().sort((a, b) => (a.from || 0) - (b.from || 0));
+    mains.forEach(p => { if (p.wind && (!p.from || p.from <= t)) w = p.wind; });
+    if (w) src = 'TAF';
+  }
+  if (!w && an && an.metar && an.metar.wind) { w = an.metar.wind; src = 'METAR'; }
+  return {w, src};
+}
+// Which runway end(s) the wind favours. Returns {inUse:[...], either:bool, basis:string}
+function pibRunwayInUse(ends, w, src) {
+  if (!ends.length) return {inUse: [], either: false, basis: 'No runway is named in the briefing for this aerodrome.'};
+  if (!w) return {inUse: [], either: false, basis: 'No wind available - runway in use unknown.'};
+  if (w.dir == null || w.spd <= 3) return {inUse: ends.slice(), either: true, basis: src + ' wind ' + (w.dir == null ? 'variable' : 'light') + ' (' + w.spd + ' kt): either direction possible.'};
+  let best = null;
+  ends.forEach(e => { const h = +e.slice(0, 2) * 10, head = w.spd * Math.cos((w.dir - h) * Math.PI / 180); if (!best || head > best.head) best = {e, head, h}; });
+  const num = best.e.slice(0, 2), use = ends.filter(e => e.slice(0, 2) === num);
+  const cross = Math.round(Math.abs(w.spd * Math.sin((w.dir - best.h) * Math.PI / 180)));
+  return {inUse: use, either: false, basis: src + ' wind ' + String(w.dir).padStart(3, '0') + '/' + w.spd + (w.gst ? 'G' + w.gst : '') + ' kt favours RWY ' + use.join('/') + ' (' + Math.round(best.head) + ' kt head, ' + cross + ' kt cross).'};
+}
+
+// ---- when is a NOTAM active -----------------------------------------------------------------
+const PIB_DOW = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+const PIB_MONS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+// -> {state:'yes'|'no'|'maybe', intervals:[[ms,ms]], why}
+function pibActive(n, from, to) {
+  const b = dpxNotamDate(n.b), c = n.c ? dpxNotamDate(n.c) : null;
+  if (!from || !to) return {state: 'maybe', intervals: [], why: 'flight times unknown'};
+  const rs = Math.max(b ? b.getTime() : -Infinity, from.getTime()), re = Math.min(c ? c.getTime() : Infinity, to.getTime());
+  if (rs > re) return {state: 'no', intervals: [], why: b && b > to ? 'starts after you are there' : 'ended before you are there'};
+  if (!n.d) return {state: 'yes', intervals: [[rs, re]], why: 'valid throughout'};
+  const D = n.d.toUpperCase().replace(/\s+/g, ' ').trim();
+  if (/^(H24|24H)$/.test(D)) return {state: 'yes', intervals: [[rs, re]], why: 'H24'};
+  const segs = D.split(/\s*,\s*(?=\d|[A-Z]{3}\b)/), ivs = [];
+  let lastMon = null, ok = true;
+  const day0 = Date.UTC(new Date(rs).getUTCFullYear(), new Date(rs).getUTCMonth(), new Date(rs).getUTCDate()) - 86400000;
+  segs.forEach(seg => {
+    const times = []; seg.replace(/(\d{2})(\d{2})-(\d{2})(\d{2})/g, (_, a, b2, c2, d2) => { times.push([+a * 60 + +b2, +c2 * 60 + +d2]); return ''; });
+    const spec = seg.replace(/\d{4}-\d{4}/g, '').trim();
+    if (!times.length) { ok = false; return; }
+    let test;
+    if (spec === '' || spec === 'DLY') test = () => true;
+    else if (/^[A-Z]{3}(?:\s*[-\/ ]\s*[A-Z]{3})*$/.test(spec) && PIB_DOW.includes(spec.slice(0, 3))) {
+      const toks = spec.match(/[A-Z]{3}/g), rng = /-/.test(spec) && toks.length === 2;
+      if (!toks.every(t => PIB_DOW.includes(t))) { ok = false; return; }
+      const set = new Set();
+      if (rng) { let i = PIB_DOW.indexOf(toks[0]); const e = PIB_DOW.indexOf(toks[1]); for (let k = 0; k < 8; k++) { set.add(PIB_DOW[i % 7]); if (i % 7 === e) break; i++; } }
+      else toks.forEach(t => set.add(t));
+      test = dt => set.has(PIB_DOW[dt.getUTCDay()]);
+    } else {
+      const dm = spec.match(/^(\d{1,2})(?:-(\d{1,2}))?(?:\s+([A-Z]{3}))?$/);
+      if (!dm) { ok = false; return; }
+      const mon = dm[3] ? PIB_MONS.indexOf(dm[3]) : lastMon; if (mon == null || mon < 0) { ok = false; return; }
+      lastMon = mon; const d1 = +dm[1], d2 = dm[2] ? +dm[2] : d1;
+      test = dt => dt.getUTCMonth() === mon && dt.getUTCDate() >= d1 && dt.getUTCDate() <= d2;
+    }
+    for (let ms = day0; ms <= re + 86400000; ms += 86400000) {
+      const dt = new Date(ms); if (!test(dt)) continue;
+      times.forEach(t => { const s = ms + t[0] * 60000; let e = ms + t[1] * 60000; if (t[1] <= t[0]) e += 86400000; ivs.push([s, e]); });
+    }
+  });
+  if (!ok) return {state: 'maybe', intervals: [], why: 'schedule "' + n.d + '" not understood'};
+  const hit = ivs.filter(v => v[1] > rs && v[0] < re).map(v => [Math.max(v[0], rs), Math.min(v[1], re)]);
+  return hit.length ? {state: 'yes', intervals: hit, why: 'scheduled ' + n.d} : {state: 'no', intervals: [], why: 'its schedule (' + n.d + ') does not fall in your times'};
+}
+
+// ---- meaning ------------------------------------------------------------------------------
+function pibSnippet(t, len) { t = String(t || '').replace(/\s+/g, ' ').trim(); return t.length > len ? t.slice(0, len - 1) + '…' : t; }
+function pibFmtIv(iv) {
+  const f = ms => { const d = new Date(ms); return String(d.getUTCHours()).padStart(2, '0') + String(d.getUTCMinutes()).padStart(2, '0') + 'Z'; };
+  return iv.length ? f(iv[0][0]) + '-' + f(iv[iv.length - 1][1]) : '';
+}
+function pibClassify(n, ctx) {
+  const T = (n.text || '').toUpperCase(), rw = pibRwys(T), inUse = ctx.inUse || [], hit = rw.filter(r => inUse.includes(r));
+  const act = ctx.active, when = act.state === 'maybe' ? ' (schedule not understood - assume it applies)' : act.state === 'yes' && act.intervals.length && n.d ? ' Active ' + pibFmtIv(act.intervals) + '.' : '';
+  const R = (sev, kind, impl) => ({sev: act.state === 'no' ? 'info' : sev, kind, implication: (act.state === 'no' ? 'Not active at your times (' + act.why + '). ' : '') + impl + (act.state === 'no' ? '' : when), rwys: rw});
+  const arr = ctx.arrives, dep = ctx.departs;
+  const rwTxt = rw.length ? 'RWY ' + rw.join('/') : '';
+  const known = ctx.inUse && ctx.inUse.length && !ctx.either;
+  const other = known && rw.length && !hit.length;
+  if (/\b(AD|AERODROME|AIRPORT)\b[^.]{0,30}\b(CLSD|CLOSED)\b/.test(T) && !/\bTWY\b|\bAPRON\b/.test(T.split(/CLSD|CLOSED/)[0]))
+    return R('bad', 'Aerodrome closed', 'Aerodrome closed.');
+  if (/\bRWY\b[^.]{0,40}\b(CLSD|CLOSED)\b/.test(T) && !/\bTWY\b/.test(T.split('RWY')[0])) {
+    const ends = ctx.ends || [], allClosed = ends.length && ends.every(e => rw.includes(e) || rw.includes(pibRecip(e)));
+    const detail = ' (' + pibSnippet(n.text, 110) + ')';
+    if (allClosed) return R('bad', 'Runway closed', rwTxt + ' closed and it is the only runway named in the briefing for ' + ctx.icao + ' - the aerodrome may be unusable' + detail + '.');
+    if (hit.length) return R('bad', 'Runway closed', rwTxt + ' closed - that is the runway the wind favours (' + hit.join('/') + '). Expect the opposite direction or another runway' + (ctx.either ? '' : ': check tailwind and performance') + detail + '.');
+    if (ctx.either || !known) return R('warn', 'Runway closed', rwTxt + ' closed; runway in use not known' + detail + '.');
+    return R('warn', 'Runway closed', rwTxt + ' closed - not the runway the wind favours (' + inUse.join('/') + '), but if the wind shifts or ATC changes direction it matters' + detail + '.');
+  }
+  if (/\bRWY\b.{0,60}\b(WIP|WORK IN PROGRESS|CONSTRUCTION|SHORTENED|REDUCED|DISPLACED|DECLARED DIST|RESURFAC|CONTAMINATED|BRAKING|FRICTION|STRIP|LIGHTS? U\/S|LGT U\/S)/.test(T) || /\bWIP\b.{0,40}\bRWY\b/.test(T))
+    return R(hit.length || !known ? 'warn' : 'info', 'Runway works / restriction', (rwTxt || 'Runway') + ' restricted: ' + pibSnippet(n.text, 140) + (hit.length ? ' - this is the runway in use; check performance and length.' : ''));
+  const ils = /\b(ILS|LOC|LOCALI[ZS]ER|GP|GLIDE ?PATH)\b/.test(T) && /(U\/S|UNSERVICEABLE|NOT AVBL|WITHDRAWN|UNAVAILABLE)/.test(T);
+  if (ils) {
+    const rel = hit.length || (!known && rw.length) || !rw.length;
+    return R(arr && rel ? 'warn' : 'info', 'ILS / localiser unserviceable', (rwTxt || 'The ILS') + ' ILS/LOC unserviceable' + (/ASSOCIATED PROC/.test(T) ? ', associated procedures suspended' : '') + '. ' + (hit.length ? 'That is the runway in use - plan on a non-precision or RNP approach and use non-precision minima in the minima advisor.' : known && rw.length ? 'Not the runway in use now; matters if you are given the other direction.' : 'Runway in use unknown - assume you have no ILS there.'));
+  }
+  if (/\b(VOR|DME|NDB|TACAN|RNAV|RNP|GNSS|GPS|PAPI|VASI|APCH LGT|ALS|ATIS|RADAR|MSSR|PSR|SSR|VDF|VHF RELAY|ADS-?B)\b/.test(T) && /(U\/S|UNSERVICEABLE|NOT AVBL|WITHDRAWN|OUT OF SERVICE|INTERMITTENT)/.test(T))
+    return R(ctx.scope === 'aerodrome' ? 'warn' : 'info', 'Nav / comms aid', pibSnippet(n.text, 150) + (ctx.scope === 'aerodrome' ? ' - check it is not in your approach or departure.' : ' - around the aerodrome; only matters if your procedures use it.'));
+  if (/\b(IAC|SID|STAR|ARR-?\d+|DEP-?\d+|RNAV-?\d+|ILS-?\d+|VOR-?\d+)\b.{0,120}SUSPENDED|SUSPENDED.{0,60}\b(IAC|SID|STAR)\b/.test(T) || /APCH PROC.{0,40}SUSPENDED/.test(T)) {
+    const lines = (n.text || '').split(/(?=\b(?:SID|STAR|IAC|AERONAUTICAL DATA|\d\.\s+ARR-))/);
+    const names = []; (n.text.match(/\b(?:SID |STAR |IAC |ARR-|DEP-)[A-Z0-9 -]*?(?:RNAV|ILS|VOR|NDB)?[^.]*?RWY ?\d{2}[LRC]?[^.]*?(?=SUSPENDED|DATED|$)/g) || []).forEach(x => names.push(x.trim()));
+    const sid = /\bSID\b/.test(T), star = /\b(STAR|ARR-|IAC)/.test(T);
+    const mine = hit.length > 0;
+    const relevantRole = (sid && dep) || (star && arr);
+    const sev = relevantRole && (mine || !known) ? 'warn' : 'info';
+    return R(sev, 'Procedures suspended', (mine ? 'Procedures for the runway in use (' + hit.join('/') + ') are suspended: ' : (rwTxt ? 'Procedures for ' + rwTxt + ' suspended: ' : 'Procedures suspended: ')) + pibSnippet((mine ? n.text.split(/(?<=SUSPENDED\.?)\s*/).filter(x => pibRwys(x.toUpperCase()).some(r => hit.includes(r))).join(' ') || n.text : n.text).replace(/AERONAUTICAL DATA TABULATION[^.]*?SUSPENDED\.?/g, '').replace(/\bDATED \d{1,2} [A-Z]{3} \d{4}/g, ''), 170) + (relevantRole ? (sid ? ' Brief the SID you will actually be given.' : ' Expect a different arrival/approach or radar vectors.') : ' Not used for this phase of your flight.'));
+  }
+  if (/COMMUNICATION FAILURE PROC/.test(T) || (/TFC ON/.test(T) && /RADAR VECTORS/.test(T)) || /\bEXPECT\b|\bEXP\b/.test(T) && rw.length)
+    return R(arr && (hit.length || !known) ? 'info' : 'info', 'Procedure expectation', (hit.length ? 'On the runway in use: ' : '') + pibSnippet(n.text, 170));
+  if (/\bNIL\s+(TWR|APP|ATIS|GND|AFIS)\b|\b(TWR|APP|ATIS|GND|AFIS)\b.{0,40}\b(NOT AVBL|CLSD|U\/S|UNSERVICEABLE)/.test(T))
+    return R('warn', 'ATC service unavailable', pibSnippet(n.text, 100) + ' - arrival/departure during these times is without that service' + (/TWR/.test(T) ? ' (blind calls, no clearance; check aerodrome is usable and your minima).' : '.'));
+  if (/\b(RFF|ARFF|FIRE CAT|FIREFIGHTING|CRASH ALARM)\b/.test(T))
+    return R(/CRASH ALARM/.test(T) ? 'info' : 'warn', 'Rescue / fire', pibSnippet(n.text, 120) + (/CAT/.test(T) ? ' - compare with your required RFF category.' : ''));
+  if (/\b(FUEL|JET A1|AVTUR)\b/.test(T) && /\b(NOT AVBL|UNAVAILABLE|U\/S|LIMITED)\b/.test(T))
+    return R('warn', 'Fuel', pibSnippet(n.text, 120) + ' - check uplift before relying on it.');
+  if (/\b(UAS|RPAS|UAV|UNMANNED|MODEL ACFT|BVLOS|DRONE|BALLOON|PARACHUT|GLIDER)\b/.test(T))
+    return R('info', 'Low-level UAS / activity', pibSnippet(n.text.split(':')[0], 70) + ' up to ' + (n.g || 'a stated height') + ' - stay clear of it below that height; normally outside your departure and approach.');
+  if (/\b(TWY|TAXIWAY|APRON|STAND|GATE|TXL)\b.{0,60}\b(CLSD|CLOSED|WIP|NOT AVBL|RESTRICT)/.test(T))
+    return R('info', 'Taxiway / apron', pibSnippet(n.text, 150) + (dep ? ' - affects your taxi routing and push-back.' : ''));
+  if (/\bTRIGGER NOTAM|AIRAC|REPRINT|AIP SUP|CHARTS?\b.*\b(WEF|AMDT)/.test(T)) return R('info', 'Admin / AIP change', pibSnippet(n.text, 120));
+  if (rw.length) return R(hit.length ? 'info' : 'info', 'Runway-specific', (hit.length ? 'Concerns the runway in use: ' : '') + pibSnippet(n.text, 160));
+  return R('info', 'Other', pibSnippet(n.text, 160));
+}
+
+// ---- the flight -----------------------------------------------------------------------------
+function pibFirLevel(n, plan) {
+  const T = (n.text || '').toUpperCase(), act = n.__act;
+  const r = (sev, kind, impl) => ({sev: act.state === 'no' ? 'info' : sev, kind, implication: (act.state === 'no' ? 'Not active at your times (' + act.why + '). ' : '') + impl, rwys: []});
+  const route = ' ' + String(plan.route || '').toUpperCase() + ' ' + (plan.track || []).map(p => p.name).join(' ') + ' ';
+  if (/ROUTES?\b.{0,160}SUSPENDED|SUSPENDED.{0,40}ROUTES?\b/.test(T) || /\bATS ROUTES?\b|\bAIR ROUTES\b/.test(T)) {
+    const ids = Array.from(new Set((n.text.match(/\b(?:U[A-Z]|[A-Z])\d{1,3}\b/g) || [])));
+    const used = ids.filter(id => route.indexOf(' ' + id + ' ') >= 0 || route.indexOf(' ' + id.replace(/^U(?=[A-Z]\d)/, '') + ' ') >= 0);
+    const lvl = (n.text.match(/BLW\s+(\d{3,5})/i) || [])[1], cru = (plan.cruiseFL || 0) * 100;
+    if (used.length) {
+      const below = lvl && cru && cru > +lvl;
+      return r(below ? 'info' : 'bad', 'ATS route suspended', 'Route ' + used.join(', ') + ' on your plan is suspended' + (lvl ? ' below ' + lvl + ' ft' : '') + (below ? ' - you cruise above that' : ' - the planned route is not available; expect a re-route') + '.');
+    }
+    return r('info', 'ATS route suspended', 'Routes suspended: ' + ids.slice(0, 8).join(', ') + ' - none of them are named in your route.');
+  }
+  const nav = n.text.match(/\b(VOR\/DME|VOR|DME|NDB|TACAN)\s+([A-Z]{2,3})\b/);
+  if (nav && /(U\/S|UNSERVICEABLE|NOT AVBL|WITHDRAWN|OUT OF SERVICE)/.test(T)) {
+    const used = route.indexOf(' ' + nav[2] + ' ') >= 0;
+    return r(used ? 'warn' : 'info', 'Nav aid unserviceable', nav[1] + ' ' + nav[2] + ' unserviceable' + (used ? ' - it is a point on your route/track; plan the alternative and check RNAV cover.' : ' - not on your route.') + (/ASSOCIATED PROC/.test(T) ? ' Associated procedures suspended.' : ''));
+  }
+  if (/\b(MSSR|SSR|RADAR|VHF RELAY|VDF|ADS-?B|ATIS)\b/.test(T) && /(U\/S|UNSERVICEABLE|INTERMITTENT|NOT AVBL)/.test(T))
+    return r('info', 'Comms / surveillance', pibSnippet(n.text, 130) + ' - possible loss of radar or VHF cover in that area; have the backup frequency ready.');
+  if (/\b(UAS|RPAS|UAV|BVLOS|MODEL ACFT|BALLOON|PARACHUT|AEROBATIC|GLIDER)\b/.test(T))
+    return r('info', 'Low-level UAS / activity', pibSnippet(n.text.split(':')[0], 70) + ' up to ' + (n.g || 'a stated height') + ' - below cruise.');
+  const sv = dpxNotamSeverity(n, false);
+  if (sv && sv[0] === 'warn') return r('warn', sv[1], pibSnippet(n.text, 170));
+  return r('info', 'Other', pibSnippet(n.text, 150));
+}
+
+function dpxPibAnalyse(pib, plan, wxStations) {
+  const stations = {}; wxStations.forEach(a => { stations[a.icao] = a; });
+  const byAd = {}; pib.notams.forEach(n => { if (n.section) (byAd[n.section] = byAd[n.section] || []).push(n); });
+  const rwyInfo = [], notams = [];
+  const planFirs = new Set((plan.firs || []).map(f => f.fir));
+  // runways expected at each aerodrome on the plan
+  const ctxFor = {};
+  wxStations.forEach(a => {
+    const roles = a.roles || [];
+    const ends = pibAeroEnds(byAd[a.icao] || [], a.icao);
+    const win = a.window || {from: plan.etd, to: plan.eta};
+    const dep = roles.some(r => /Departure/.test(r)), arr = roles.some(r => /Destination|Alternate/.test(r));
+    const t = dep && !arr ? plan.etd : (win.from && win.to ? new Date((win.from.getTime() + win.to.getTime()) / 2) : plan.eta);
+    const wd = pibWindAt(a, t), ru = pibRunwayInUse(ends, wd.w, wd.src);
+    ctxFor[a.icao] = {icao: a.icao, ends, inUse: ru.inUse, either: ru.either, departs: dep, arrives: arr, win, scope: 'aerodrome'};
+    rwyInfo.push({icao: a.icao, roles: roles.join(' + '), at: t, ends, inUse: ru.inUse, either: ru.either, basis: ru.basis});
+  });
+  pib.notams.forEach(n => {
+    const isAd = n.sectionKind === 'aerodrome' || n.sectionKind === 'cylinder';
+    const st = isAd ? stations[n.section] : null;
+    let res, onPlan;
+    if (isAd) {
+      onPlan = !!st;
+      const base = ctxFor[n.section] || {icao: n.section, ends: pibAeroEnds(byAd[n.section] || [], n.section), inUse: [], departs: false, arrives: false, win: {from: plan.etd, to: plan.eta}};
+      const ctx = {...base, scope: n.sectionKind === 'cylinder' ? 'cylinder' : 'aerodrome', active: pibActive(n, base.win.from, base.win.to)};
+      res = pibClassify(n, ctx);
+      res.active = ctx.active;
+    } else {
+      onPlan = planFirs.has(n.section) || !planFirs.size;
+      const fw = (plan.firs || []).find(f => f.fir === n.section), win = fw ? {from: fw.from, to: fw.to} : {from: plan.etd, to: plan.eta};
+      n.__act = pibActive(n, win.from, win.to);
+      res = pibFirLevel(n, plan); res.active = n.__act; delete n.__act;
+    }
+    const sev = onPlan ? res.sev : 'info';
+    notams.push({...n, sev, kind: res.kind, implication: res.implication, rwys: res.rwys, activeState: res.active.state, onPlan,
+                 scopeKind: n.sectionKind, note: res.active.state === 'no' ? 'Not active at your times' : null});
+  });
+  return {notams, rwyInfo};
+}
+
 // Main entry: plan (required) + weather folder (optional) -> everything the UI shows.
 function dpxBuildPack(plan, folder, opts) {
   opts = opts || {};
@@ -2943,17 +3229,34 @@ function dpxBuildPack(plan, folder, opts) {
     else if (b && plan.eta && b > plan.eta) note = 'Starts after ETA';
     return {...n, sev: n.type === 'NOTAMC' ? 'info' : (sv ? sv[0] : 'info'), kind: sv ? sv[1] : 'Cancellation', note, bDate: b, cDate: c};
   });
+  let rwyInfo = [], pibInfo = null;
+  if (opts.pib && opts.pib.notams) {
+    const pa = dpxPibAnalyse(opts.pib, plan, wxStations);
+    rwyInfo = pa.rwyInfo;
+    const ids = new Set(pa.notams.map(n => n.id));
+    for (let i = notams.length - 1; i >= 0; i--) if (ids.has(notams[i].id)) notams.splice(i, 1);   // the briefing's copy replaces the one printed in the plan
+    pa.notams.forEach(n => notams.push(n));
+    pibInfo = {total: opts.pib.notams.length, onPlan: pa.notams.filter(n => n.onPlan).length, docs: opts.pib.docs, period: opts.pib.period, warnings: opts.pib.warnings};
+    const worth = pa.notams.filter(n => n.onPlan && n.sev === 'warn' && n.activeState !== 'no');
+    worth.slice(0, 8).forEach(n => F('warn', 'NOTAM', (n.section || '') + ' ' + n.id + ' - ' + n.kind + ': ' + n.implication));
+    if (worth.length > 8) F('warn', 'NOTAM', (worth.length - 8) + ' more NOTAM cautions - see the NOTAM list.');
+    if (opts.pib.adep && plan.dep && opts.pib.adep !== plan.dep || opts.pib.ades && plan.arr && opts.pib.ades !== plan.arr)
+      F('bad', 'NOTAM', 'The NOTAM briefing is for ' + opts.pib.adep + ' - ' + opts.pib.ades + ' but your plan is ' + plan.dep + ' - ' + plan.arr + '. Wrong briefing?');
+    wxStations.forEach(a => { if (!opts.pib.notams.some(n => n.section === a.icao) && !opts.pib.alternates.includes(a.icao) && a.icao !== opts.pib.adep && a.icao !== opts.pib.ades) F('warn', 'NOTAM', a.icao + ' is on your plan but is not in the NOTAM briefing - get its NOTAMs.'); });
+  }
   const nb = notams.filter(n => n.sev === 'bad').length, nw = notams.filter(n => n.sev === 'warn').length;
   // one headline problem per closure NOTAM, so an en-route / alternate closure (e.g. a runway closed) is counted, not buried
   notams.filter(n => n.sev === 'bad' && !n.note).forEach(n => {
     const where = n.section || n.loc || 'aerodrome';
     const st = plan.stations.find(x => x.icao === n.section);
     const role = st && st.role ? ' (' + st.role + ')' : '';
+    if (n.implication) { if (n.onPlan) F('bad', 'NOTAM', where + role + ' ' + n.id + ' - ' + n.kind + ': ' + n.implication); return; }
     F('bad', 'NOTAM', where + role + ' ' + n.id + ': ' + (n.title || n.kind || 'closure') + ' - ' + String(n.text || '').replace(/\s+/g, ' ').slice(0, 140) + (n.b || n.c ? ' [' + (n.b || '?') + ' to ' + (n.c || '?') + ']' : ''));
   });
   notams.filter(n => n.sev === 'bad' && n.note).forEach(n => F('info', 'NOTAM', (n.loc || n.section || '') + ' ' + n.id + ' looks like a closure but: ' + n.note.toLowerCase() + '.'));
-  if (nw) F('warn', 'NOTAM', nw + ' NOTAM' + (nw > 1 ? 's' : '') + ' mention nav-aid / runway / fuel / airspace issues.');
-  if (plan.notams.length) F('info', 'NOTAM', plan.notams.length + ' NOTAMs in the pack. Flags come from keyword matching - they help you find the important ones but do NOT replace reading all of them.');
+  const nwPlain = notams.filter(n => n.sev === 'warn' && !n.implication).length;
+  if (nwPlain) F('warn', 'NOTAM', nwPlain + ' NOTAM' + (nwPlain > 1 ? 's' : '') + ' mention nav-aid / runway / fuel / airspace issues.');
+  if (notams.length) F('info', 'NOTAM', notams.length + ' NOTAMs in the pack. Flags come from keyword matching - they help you find the important ones but do NOT replace reading all of them.');
 
   // roll up station problems into findings
   wxStations.forEach(a => {
@@ -2962,7 +3265,7 @@ function dpxBuildPack(plan, folder, opts) {
   const rank = {bad: 0, warn: 1, info: 2};
   findings.sort((a, b) => rank[a.sev] - rank[b.sev]);
 
-  return {plan, folder, stations: wxStations, folderStations, sigmets, notams, findings,
+  return {plan, folder, stations: wxStations, folderStations, sigmets, notams, findings, rwyInfo, pibInfo,
           worst: findings.some(f => f.sev === 'bad') ? 'bad' : findings.some(f => f.sev === 'warn') ? 'warn' : 'ok'};
 }
 
@@ -2991,19 +3294,20 @@ function dpxState() {
     dpxIdbGet('charts').then(v => { if (v && state.dpx) { state.dpx.charts = {plan: v.plan || [], folder: v.folder || []}; render(); } }).catch(() => {});
     try {
       const s = JSON.parse(localStorage.getItem(DPX_LS) || 'null');
-      if (s) { dpxApply(state.dpx, s.planPages, s.folderPages); state.dpx.savedAt = s.savedAt; }
+      if (s) { let nb = null; try { nb = JSON.parse(localStorage.getItem(DPX_LS + '_notam') || 'null'); } catch (e) {} dpxApply(state.dpx, s.planPages, s.folderPages, nb); state.dpx.savedAt = s.savedAt; }
     } catch (e) { /* stale or corrupt saved pack - ignore */ }
   }
   return state.dpx;
 }
 
 // Parse + cross-check from extracted page lines. Pure apart from writing into `d`.
-function dpxApply(d, planPages, folderPages) {
+function dpxApply(d, planPages, folderPages, notamPages) {
   const wrap = ps => ps && ps.map(p => ({n: p.n, lines: p.lines, text: p.lines.join('\n')}));
-  d.planPages = planPages || null; d.folderPages = folderPages || null;
+  d.planPages = planPages || null; d.folderPages = folderPages || null; d.notamPages = notamPages || null;
   d.plan = planPages ? dpxParsePlan(wrap(planPages)) : null;
   d.folder = folderPages ? dpxParseFolder(wrap(folderPages)) : null;
-  d.pack = d.plan && d.plan.dep ? dpxBuildPack(d.plan, d.folder) : null;
+  d.pib = notamPages ? dpxParsePib(wrap(notamPages)) : null;
+  d.pack = d.plan && d.plan.dep ? dpxBuildPack(d.plan, d.folder, {pib: d.pib}) : null;
 }
 
 async function dpxLoadFiles(fileList) {
@@ -3013,12 +3317,13 @@ async function dpxLoadFiles(fileList) {
   if (!window.pdfjsLib) { d.error = 'The PDF reader has not loaded (it needs the internet the first time). Reload the app once while online.'; render(); return; }
   d.loading = true; d.error = ''; d.notes = []; render();
   try {
-    let planPages = d.planPages, folderPages = d.folderPages;
+    let planPages = d.planPages, folderPages = d.folderPages, notamPages = d.notamPages;
     for (const f of files) {
       if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') { d.notes.push(f.name + ': not a PDF - skipped.'); continue; }
       const data = new Uint8Array(await f.arrayBuffer()), copy = data.slice();
       const pages = await dpxExtractPages(window.pdfjsLib, data);
-      const kind = dpxClassify(pages);
+      let kind = dpxClassify(pages);
+      if (kind === 'pib') { const raw = await dpxExtractPages(window.pdfjsLib, copy.slice(), true); pages.length = 0; raw.forEach(p => pages.push(p)); }
       if (kind === 'plan' || kind === 'weather') {
         const k = kind === 'plan' ? 'plan' : 'folder';
         d.chartsBusy = true; render();
@@ -3027,15 +3332,17 @@ async function dpxLoadFiles(fileList) {
       }
       const slim = pages.map(p => ({n: p.n, lines: p.lines}));
       if (kind === 'plan') { planPages = slim; d.notes.push(f.name + ': read as the flight plan (' + pages.length + ' pages).'); }
+      else if (kind === 'pib') { notamPages = slim; d.notes.push(f.name + ': read as the NOTAM briefing (' + pages.length + ' pages).'); }
       else if (kind === 'weather') { folderPages = slim; d.notes.push(f.name + ': read as the weather folder (' + pages.length + ' pages).'); }
-      else d.notes.push(f.name + ': not recognised as a flight plan or weather folder - skipped. Only the standard dispatch layout is supported.');
+      else d.notes.push(f.name + ': not recognised as a flight plan, weather folder or NOTAM briefing - skipped. Only the standard dispatch layout is supported.');
     }
     if (!planPages) { d.error = 'No flight plan found. Add the flight plan PDF (it starts with the route, e.g. "FZAA - FAOR") - the weather folder alone is not enough.'; }
-    dpxApply(d, planPages, folderPages);
+    dpxApply(d, planPages, folderPages, notamPages);
     try { await dpxIdbPut('charts', d.charts); } catch (e) { /* charts still show this session */ }
     if (d.pack) {
       d.savedAt = Date.now();
       try { localStorage.setItem(DPX_LS, JSON.stringify({planPages, folderPages, savedAt: d.savedAt})); } catch (e) { /* storage full - pack still works this session */ }
+      try { if (notamPages) localStorage.setItem(DPX_LS + '_notam', JSON.stringify(notamPages)); } catch (e) { /* too big to keep - the briefing works this session only */ }
     }
   } catch (e) {
     d.error = 'Could not read that PDF: ' + (e && e.message ? e.message : e);
@@ -3044,7 +3351,7 @@ async function dpxLoadFiles(fileList) {
 }
 
 function dpxClear() {
-  try { localStorage.removeItem(DPX_LS); } catch (e) {}
+  try { localStorage.removeItem(DPX_LS); localStorage.removeItem(DPX_LS + '_notam'); } catch (e) {}
   dpxIdbDel('charts').catch(() => {});
   // the pilot's confirmations belong to the pack - clearing the pack starts the next one with empty boxes
   try { Object.keys(localStorage).filter(k => (k.indexOf('salogbook_dpx_checks_') === 0 || k.indexOf('salogbook_dpx_actual_') === 0)).forEach(k => localStorage.removeItem(k)); } catch (e) {}
@@ -3169,6 +3476,7 @@ function dpxNotamRow(n) {
   const row = el('details', {style: {background: n.sev === 'info' ? '#F8F9FA' : c.bg, border: '1px solid ' + (n.sev === 'info' ? '#E9ECEF' : c.bd), borderRadius: '6px', padding: '5px 10px', marginBottom: '4px', fontSize: '12px'}});
   row.appendChild(el('summary', {style: {cursor: 'pointer', color: n.sev === 'info' ? '#444' : c.fg}},
     el('b', {style: {fontFamily: 'monospace'}}, n.id), ' ' + (n.title || n.kind) + (n.loc && n.loc !== n.section ? ' [' + n.loc + ']' : '') + (n.note ? ' - ' + n.note : '')));
+  if (n.implication) row.appendChild(div({style: {fontSize: '12px', fontWeight: '600', color: n.sev === 'info' ? '#444' : c.fg, margin: '6px 0 2px', lineHeight: '1.45'}}, n.implication));
   row.appendChild(el('pre', {style: {whiteSpace: 'pre-wrap', fontSize: '11px', margin: '6px 0 2px', color: '#333'}},
     (n.b ? 'From ' + n.b : '') + (n.c ? '  To ' + n.c : '') + (n.d ? '\nSchedule: ' + n.d : '') + '\n' + n.text + ((n.f || n.g) ? '\nLevels: ' + (n.f || '?') + ' to ' + (n.g || '?') : '')));
   return row;
@@ -3438,8 +3746,20 @@ function dpxRender(main) {
   // NOTAMs
   main.appendChild(el('h3', {style: {margin: '14px 0 8px', fontSize: '15px'}}, 'NOTAMs (' + pack.notams.length + ')'));
   main.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '8px'}}, 'Coloured ones matched keywords such as closures, suspended procedures, nav-aid failures or runway works. Grey ones did not match - that does not mean they are irrelevant. Read them all.'));
-  const groups = [];
-  pack.notams.forEach(n => { let g = groups.find(x => x.key === n.section); if (!g) { g = {key: n.section, kind: n.sectionKind, items: []}; groups.push(g); } g.items.push(n); });
+  if (pack.rwyInfo && pack.rwyInfo.length) {
+    const rc = div({style: {background: '#fff', border: '1px solid #DEE2E6', borderLeft: '5px solid #006B3F', borderRadius: '8px', padding: '10px 16px', marginBottom: '10px'}});
+    rc.appendChild(div({style: {fontWeight: '700', fontSize: '13px', marginBottom: '4px'}}, 'Runways expected from the forecast wind'));
+    pack.rwyInfo.forEach(r => rc.appendChild(div({style: {fontSize: '12px', margin: '3px 0', lineHeight: '1.45'}}, el('b', {style: {fontFamily: 'monospace'}}, r.icao), ' ' + r.roles + ' (' + dpxFmtZ(r.at) + '): ', el('b', {}, r.inUse.length ? (r.either ? 'either direction' : 'RWY ' + r.inUse.join('/')) : 'unknown'), el('span', {style: {color: '#666'}}, ' - ' + r.basis))));
+    rc.appendChild(div({style: {fontSize: '10px', color: '#888', marginTop: '4px'}}, 'A guide only: ATC chooses the runway. Runways are taken from the ones named in the briefing, with the reciprocal added, and wind directions are used as magnetic. A NOTAM on the other direction is shown as a caution, not a problem.'));
+    main.appendChild(rc);
+  }
+  if (pack.pibInfo && pack.pibInfo.docs && pack.pibInfo.docs.length) pack.pibInfo.docs.forEach(dc => main.appendChild(el('details', {style: {background: '#F8F9FA', border: '1px solid #E9ECEF', borderRadius: '6px', padding: '5px 10px', marginBottom: '6px', fontSize: '12px'}}, el('summary', {style: {cursor: 'pointer'}}, (dc.icao || '') + ' document ' + dc.name), div({style: {margin: '6px 0', color: '#333'}}, dc.text))));
+  const groups = [], offPlan = [];
+  pack.notams.forEach(n => {
+    const kind = n.sectionKind === 'fir' ? 'fir' : 'aerodrome';
+    if (n.onPlan === false) { offPlan.push(n); return; }
+    let g = groups.find(x => x.key === n.section); if (!g) { g = {key: n.section, kind, items: []}; groups.push(g); } g.items.push(n);
+  });
   groups.forEach(g => {
     const flagged = g.items.filter(n => n.sev !== 'info'), rest = g.items.filter(n => n.sev === 'info');
     const roles = g.kind === 'aerodrome' ? ((pack.stations.find(s => s.icao === g.key) || {}).roles || []).join(' + ') : 'FIR';
@@ -3454,6 +3774,10 @@ function dpxRender(main) {
     } else rest.forEach(n => body.appendChild(dpxNotamRow(n)));
     box.appendChild(body); main.appendChild(box);
   });
+  if (offPlan.length) {
+    const ob = el('details', {style: {background: '#F8F9FA', border: '1px solid #E9ECEF', borderRadius: '8px', padding: '8px 14px', marginBottom: '10px'}}, el('summary', {style: {cursor: 'pointer', fontSize: '12px', color: '#555'}}, offPlan.length + ' NOTAMs for aerodromes / FIRs in the briefing that are not on your flight plan'));
+    offPlan.forEach(n => ob.appendChild(dpxNotamRow(n))); main.appendChild(ob);
+  }
 
   // weather folder
   if (pack.folder) {
