@@ -283,7 +283,7 @@ sb.auth.onAuthStateChange(async (event, session) => {
     await loadAll();
   } else {
     state.session = null;
-    state.profile = null; state.flights = []; state.endorsements = []; state.documents = [];
+    state.profile = null; state.flights = []; state.endorsements = []; state.documents = []; state.nb = null;
   }
   state.loading = false;
   render();
@@ -3339,6 +3339,7 @@ function dpxRender(main) {
   }
 
   main.appendChild(btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '8px', padding: '11px 20px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', marginTop: '6px'}, onclick: dpxLogThisFlight}, 'Log this flight'));
+  main.appendChild(btn({style: {width: 'auto', background: '#fff', color: '#006B3F', border: '1px solid #006B3F', borderRadius: '8px', padding: '11px 20px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', marginTop: '6px', marginLeft: '8px'}, onclick: () => nbOpenFor(p.dep + '-' + p.arr + ' ' + (p.etd ? p.etd.toISOString().slice(0, 10) : ''))}, 'Add trip note'));
   main.appendChild(div({style: {fontSize: '10px', color: '#999', marginTop: '6px'}}, 'Pre-fills the date, airports, route, type and flight number from the documents. Times and hours are left for you to enter after the flight.'));
   const ov = dpxChartOverlay(d); if (ov) main.appendChild(ov);
 }
@@ -3712,6 +3713,239 @@ function minCard(pack) {
   return card;
 }
 
+// ================= TRIP NOTEBOOK ======================================================
+// Per-trip timeline of notes and photos. Photos are shrunk on this device (about 300 KB each, EXIF/GPS removed
+// by the re-encode) and stored in the private "pilot-docs" bucket under <user id>/notebook/. Notes live in
+// the trip_notes table (see supabase/trip_notes.sql). Videos are not supported yet.
+const NB_SQL = `-- Trip notebook: run once in the Supabase SQL editor.
+-- Photos are stored in the existing private "pilot-docs" bucket under <user id>/notebook/.
+create table if not exists public.trip_notes (
+  id uuid primary key default gen_random_uuid(),
+  pilot_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  flight_id uuid,
+  trip text not null default 'General',
+  body text not null default '',
+  photos jsonb not null default '[]'::jsonb,
+  noted_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists trip_notes_pilot_idx on public.trip_notes (pilot_id, noted_at desc);
+alter table public.trip_notes enable row level security;
+drop policy if exists "trip_notes_select" on public.trip_notes;
+drop policy if exists "trip_notes_insert" on public.trip_notes;
+drop policy if exists "trip_notes_update" on public.trip_notes;
+drop policy if exists "trip_notes_delete" on public.trip_notes;
+create policy "trip_notes_select" on public.trip_notes for select using (pilot_id = auth.uid());
+create policy "trip_notes_insert" on public.trip_notes for insert with check (pilot_id = auth.uid());
+create policy "trip_notes_update" on public.trip_notes for update using (pilot_id = auth.uid()) with check (pilot_id = auth.uid());
+create policy "trip_notes_delete" on public.trip_notes for delete using (pilot_id = auth.uid());
+`;
+const NB_MAX_KB = 300, NB_MAX_DIM = 1600, NB_WARN_MB = 800;
+
+function nbState() {
+  if (!state.nb) state.nb = {rows: [], loaded: false, loading: false, missing: false, error: '', urls: {}, viewer: null, editId: null,
+    form: {open: false, trip: '', flightId: '', body: '', files: [], saving: false, busy: false}};
+  return state.nb;
+}
+async function nbLoad(force) {
+  const nb = nbState();
+  if ((nb.loaded && !force) || nb.loading || !state.session) return;
+  nb.loading = true;
+  try {
+    const { data, error } = await sb.from('trip_notes').select('*').eq('pilot_id', state.session.user.id).order('noted_at', {ascending: false}).limit(500);
+    if (error) throw error;
+    nb.rows = data || []; nb.missing = false; nb.error = '';
+    await nbSignUrls(nb.rows.flatMap(r => (r.photos || []).map(p => p.path)));
+  } catch (e) {
+    const msg = String((e && (e.message || e.code)) || e);
+    if (/trip_notes|PGRST205|42P01/.test(msg + ' ' + (e && e.code))) nb.missing = true; else nb.error = msg;
+  }
+  nb.loading = false; nb.loaded = true; render();
+}
+async function nbSignUrls(paths) {
+  const nb = nbState(), need = paths.filter(p => !nb.urls[p]);
+  if (!need.length) return;
+  try {
+    const { data } = await sb.storage.from('pilot-docs').createSignedUrls(need, 3600);
+    (data || []).forEach(d => { if (d && d.signedUrl) nb.urls[d.path || need[0]] = d.signedUrl; });
+  } catch (e) { /* thumbnails just stay blank; notes still show */ }
+}
+
+// Shrink a photo: longest side NB_MAX_DIM, JPEG, then lower quality / size until it is about NB_MAX_KB.
+async function nbCompress(file) {
+  let bmp;
+  try { bmp = await createImageBitmap(file, {imageOrientation: 'from-image'}); }
+  catch (e) { bmp = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = URL.createObjectURL(file); }); }
+  let w0 = bmp.width, h0 = bmp.height, scale = Math.min(1, NB_MAX_DIM / Math.max(w0, h0)), blob = null, w = 0, h = 0;
+  for (let round = 0; round < 4; round++) {
+    w = Math.max(1, Math.round(w0 * scale)); h = Math.max(1, Math.round(h0 * scale));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    for (const q of [0.8, 0.7, 0.6, 0.5]) {
+      blob = await new Promise(r => c.toBlob(r, 'image/jpeg', q));
+      if (blob && blob.size <= NB_MAX_KB * 1024) { if (bmp.close) bmp.close(); return {blob, w, h}; }
+    }
+    scale *= 0.8;
+  }
+  if (bmp.close) bmp.close();
+  return {blob, w, h};
+}
+async function nbAddFiles(fileList) {
+  const nb = nbState(), f = nb.form; f.busy = true; render();
+  for (const file of Array.from(fileList || [])) {
+    if (!/^image\//.test(file.type) && !/\.(jpe?g|png|heic|heif|webp)$/i.test(file.name)) { if (/^video\//.test(file.type)) toast('Videos are not supported yet', 'var(--amber)'); continue; }
+    try { const c = await nbCompress(file); f.files.push({...c, url: URL.createObjectURL(c.blob)}); }
+    catch (e) { toast('Could not read ' + file.name, 'var(--red)'); }
+  }
+  f.busy = false; render();
+}
+function nbCleanForm() { const f = nbState().form; f.files.forEach(p => { try { URL.revokeObjectURL(p.url); } catch (e) { /* ignore */ } }); nbState().form = {open: false, trip: '', flightId: '', body: '', files: [], saving: false, busy: false}; }
+function nbOpenFor(trip, flightId) { const nb = nbState(); nb.form.open = true; if (trip) nb.form.trip = trip; if (flightId) nb.form.flightId = flightId; setState({tab: 'notebook'}); }
+
+async function nbSave() {
+  const nb = nbState(), f = nb.form;
+  if (!f.body.trim() && !f.files.length) { toast('Add a note or a photo first', 'var(--amber)'); return; }
+  if (!navigator.onLine) { toast('You are offline - photos and notes need a connection to save', 'var(--amber)'); return; }
+  f.saving = true; render();
+  const uid = state.session.user.id, up = [], photos = [];
+  try {
+    for (const p of f.files) {
+      const path = uid + '/notebook/' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.jpg';
+      const { error } = await sb.storage.from('pilot-docs').upload(path, p.blob, {contentType: 'image/jpeg'});
+      if (error) throw error;
+      up.push(path); photos.push({path, w: p.w, h: p.h, size: p.blob.size});
+    }
+    const row = {pilot_id: uid, trip: f.trip.trim() || 'General', flight_id: f.flightId || null, body: f.body.trim(), photos, noted_at: new Date().toISOString()};
+    const { data, error } = await sb.from('trip_notes').insert(row).select().single();
+    if (error) throw error;
+    nb.rows = [data, ...nb.rows]; await nbSignUrls(up);
+    nbCleanForm(); toast('Note saved'); render();
+  } catch (e) {
+    if (up.length) { try { await sb.storage.from('pilot-docs').remove(up); } catch (e2) { /* best effort */ } }
+    f.saving = false; toast('Could not save: ' + ((e && e.message) || e), 'var(--red)'); render();
+  }
+}
+async function nbDelete(row) {
+  if (!confirm('Delete this note' + ((row.photos || []).length ? ' and its photos' : '') + '?')) return;
+  try {
+    const paths = (row.photos || []).map(p => p.path);
+    if (paths.length) await sb.storage.from('pilot-docs').remove(paths);
+    const { error } = await sb.from('trip_notes').delete().eq('id', row.id);
+    if (error) throw error;
+    const nb = nbState(); nb.rows = nb.rows.filter(r => r.id !== row.id); toast('Deleted'); render();
+  } catch (e) { toast('Could not delete: ' + ((e && e.message) || e), 'var(--red)'); }
+}
+async function nbUpdate(row, patch, removePath) {
+  try {
+    if (removePath) { await sb.storage.from('pilot-docs').remove([removePath]); patch.photos = (row.photos || []).filter(p => p.path !== removePath); }
+    const { data, error } = await sb.from('trip_notes').update({...patch, updated_at: new Date().toISOString()}).eq('id', row.id).select().single();
+    if (error) throw error;
+    const nb = nbState(); nb.rows = nb.rows.map(r => r.id === row.id ? data : r); render();
+  } catch (e) { toast('Could not update: ' + ((e && e.message) || e), 'var(--red)'); }
+}
+
+const nbStyle = {card: {background: '#fff', border: '1px solid #DEE2E6', borderRadius: '10px', padding: '12px 14px', marginBottom: '10px'}};
+function nbFmtWhen(iso) { const d = new Date(iso); return d.toLocaleDateString('en-ZA', {day: '2-digit', month: 'short', year: 'numeric'}) + ' ' + d.toLocaleTimeString('en-ZA', {hour: '2-digit', minute: '2-digit'}); }
+
+function nbFormCard() {
+  const nb = nbState(), f = nb.form;
+  const card = div({style: {...nbStyle.card, borderLeft: '5px solid #006B3F'}});
+  card.appendChild(div({style: {fontWeight: '800', fontSize: '14px', marginBottom: '8px'}}, 'New note'));
+  const trips = Array.from(new Set(nb.rows.map(r => r.trip))).slice(0, 30);
+  const dl = el('datalist', {id: 'nb-trips'}, ...trips.map(t => el('option', {value: t})));
+  const tripIn = inp({type: 'text', list: 'nb-trips', placeholder: 'Trip, e.g. FAOR-FZAA 2 Nov', value: f.trip, style: {width: '100%', boxSizing: 'border-box', padding: '8px', border: '1px solid #CED4DA', borderRadius: '6px', fontSize: '13px', marginBottom: '6px'}, oninput: e => { f.trip = e.target.value; }});
+  card.appendChild(dl); card.appendChild(tripIn);
+  const recent = (state.flights || []).slice(0, 15);
+  if (recent.length) {
+    const s = sel({style: {width: '100%', padding: '7px', border: '1px solid #CED4DA', borderRadius: '6px', fontSize: '12px', marginBottom: '6px'}, onchange: e => {
+      f.flightId = e.target.value; const fl = recent.find(x => x.id === f.flightId); if (fl && !f.trip.trim()) f.trip = (fl.dep_airport || '') + '-' + (fl.arr_airport || '') + ' ' + fl.date; render(); }},
+      el('option', {value: ''}, 'Link to a logbook entry (optional)'), ...recent.map(x => el('option', {value: x.id}, x.date + '  ' + (x.dep_airport || '?') + '-' + (x.arr_airport || '?') + (x.flight_number ? '  ' + x.flight_number : ''))));
+    s.value = f.flightId || ''; card.appendChild(s);
+  }
+  const ta = el('textarea', {rows: '4', placeholder: 'What happened, what you want to remember...', style: {width: '100%', boxSizing: 'border-box', padding: '8px', border: '1px solid #CED4DA', borderRadius: '6px', fontSize: '13px', fontFamily: 'inherit', resize: 'vertical'}, oninput: e => { f.body = e.target.value; }});
+  ta.value = f.body; card.appendChild(ta);
+  const fi = el('input', {type: 'file', accept: 'image/*', multiple: 'multiple', style: {display: 'none'}});
+  fi.addEventListener('change', () => { const l = fi.files; nbAddFiles(l); fi.value = ''; });
+  card.appendChild(fi);
+  if (f.files.length) {
+    const g = div({style: {display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '8px 0'}});
+    f.files.forEach((p, i) => g.appendChild(div({style: {position: 'relative'}},
+      el('img', {src: p.url, style: {width: '76px', height: '76px', objectFit: 'cover', borderRadius: '6px', border: '1px solid #DEE2E6'}}),
+      el('div', {style: {fontSize: '9px', color: '#666', textAlign: 'center'}}, Math.round(p.blob.size / 1024) + ' KB'),
+      btn({style: {position: 'absolute', top: '-6px', right: '-6px', width: '20px', height: '20px', borderRadius: '10px', border: 'none', background: '#C62828', color: '#fff', fontSize: '12px', cursor: 'pointer', padding: 0}, onclick: () => { try { URL.revokeObjectURL(p.url); } catch (e) { /* ignore */ } f.files.splice(i, 1); render(); }}, '×'))));
+    card.appendChild(g);
+  }
+  card.appendChild(div({style: {display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginTop: '8px'}},
+    btn({style: {width: 'auto', background: '#fff', border: '1px solid #CED4DA', borderRadius: '7px', padding: '8px 14px', fontSize: '12px', cursor: 'pointer'}, ...(f.busy || f.saving ? {disabled: true} : {}), onclick: () => fi.click()}, f.busy ? 'Preparing photos...' : '+ Photos'),
+    btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '7px', padding: '8px 18px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', opacity: f.saving || f.busy ? '.5' : '1'}, ...(f.busy || f.saving ? {disabled: true} : {}), onclick: nbSave}, f.saving ? 'Saving...' : 'Save'),
+    btn({style: {width: 'auto', background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer'}, onclick: () => { nbCleanForm(); render(); }}, 'Cancel')));
+  card.appendChild(div({style: {fontSize: '10px', color: '#888', marginTop: '6px'}}, 'Photos are shrunk on this device to about ' + NB_MAX_KB + ' KB and location data is removed. Notes are private to your account.'));
+  return card;
+}
+function nbNoteCard(row) {
+  const nb = nbState(), editing = nb.editId === row.id;
+  const card = div({style: {...nbStyle.card, marginLeft: '10px', borderLeft: '3px solid #006B3F'}});
+  card.appendChild(div({style: {fontSize: '11px', color: '#666', marginBottom: '4px'}}, nbFmtWhen(row.noted_at)));
+  if (editing) {
+    const ta = el('textarea', {rows: '4', style: {width: '100%', boxSizing: 'border-box', padding: '8px', border: '1px solid #CED4DA', borderRadius: '6px', fontSize: '13px', fontFamily: 'inherit'}}); ta.value = row.body || '';
+    card.appendChild(ta);
+    card.appendChild(div({style: {display: 'flex', gap: '8px', marginTop: '6px'}},
+      btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '6px', padding: '6px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: async () => { nb.editId = null; await nbUpdate(row, {body: ta.value.trim()}); }}, 'Save'),
+      btn({style: {width: 'auto', background: 'none', border: 'none', color: '#666', fontSize: '12px', cursor: 'pointer'}, onclick: () => { nb.editId = null; render(); }}, 'Cancel')));
+  } else if (row.body) card.appendChild(div({style: {fontSize: '13px', whiteSpace: 'pre-wrap', lineHeight: '1.5'}}, row.body));
+  if ((row.photos || []).length) {
+    const g = div({style: {display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '8px'}});
+    row.photos.forEach(p => {
+      const u = nb.urls[p.path];
+      const cell = div({style: {position: 'relative'}});
+      cell.appendChild(u ? el('img', {src: u, loading: 'lazy', style: {width: '88px', height: '88px', objectFit: 'cover', borderRadius: '6px', border: '1px solid #DEE2E6', cursor: 'pointer'}, onclick: () => { nb.viewer = p.path; render(); }})
+                         : div({style: {width: '88px', height: '88px', borderRadius: '6px', background: '#F1F3F5'}}));
+      if (editing) cell.appendChild(btn({style: {position: 'absolute', top: '-6px', right: '-6px', width: '20px', height: '20px', borderRadius: '10px', border: 'none', background: '#C62828', color: '#fff', cursor: 'pointer', padding: 0}, onclick: async () => { if (confirm('Remove this photo?')) await nbUpdate(row, {}, p.path); }}, '×'));
+      g.appendChild(cell);
+    });
+    card.appendChild(g);
+  }
+  if (!editing) card.appendChild(div({style: {display: 'flex', gap: '12px', marginTop: '8px'}},
+    btn({style: {width: 'auto', background: 'none', border: 'none', color: '#0066CC', fontSize: '11px', cursor: 'pointer', padding: 0}, onclick: () => { nb.editId = row.id; render(); }}, 'Edit'),
+    btn({style: {width: 'auto', background: 'none', border: 'none', color: '#C62828', fontSize: '11px', cursor: 'pointer', padding: 0}, onclick: () => nbDelete(row)}, 'Delete')));
+  return card;
+}
+function nbRender(main) {
+  const nb = nbState();
+  main.appendChild(div({style: {display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px', marginBottom: '12px'}},
+    div({}, el('div', {style: {fontSize: '18px', fontWeight: '800'}}, 'Trip notebook'), el('div', {style: {fontSize: '12px', color: '#555', marginTop: '3px'}}, 'Notes and photos for each trip - private to you.')),
+    btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '7px', padding: '8px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: () => { nb.form.open = true; render(); }}, '+ Note')));
+  if (!nb.loaded) { nbLoad(); main.appendChild(div({style: {fontSize: '12px', color: '#666'}}, 'Loading...')); return; }
+  if (nb.missing) {
+    const c = div({style: {...nbStyle.card, borderLeft: '5px solid #B26A00', background: '#FFF8E1'}});
+    c.appendChild(div({style: {fontWeight: '800', marginBottom: '4px'}}, 'One-time setup needed'));
+    c.appendChild(div({style: {fontSize: '12px', lineHeight: '1.5', marginBottom: '6px'}}, 'The notebook needs a small table in your Supabase project. Open Supabase → SQL Editor → New query, paste the text below, and press Run. Then come back and reload this tab.'));
+    c.appendChild(el('pre', {style: {fontSize: '10px', whiteSpace: 'pre-wrap', background: '#fff', border: '1px solid #E9ECEF', borderRadius: '6px', padding: '8px', maxHeight: '200px', overflow: 'auto'}}, NB_SQL));
+    c.appendChild(div({style: {display: 'flex', gap: '8px', marginTop: '6px'}},
+      btn({style: {width: 'auto', background: '#006B3F', color: '#FFB612', border: 'none', borderRadius: '6px', padding: '7px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer'}, onclick: () => { try { navigator.clipboard.writeText(NB_SQL); toast('Copied'); } catch (e) { toast('Select the text and copy it', 'var(--amber)'); } }}, 'Copy SQL'),
+      btn({style: {width: 'auto', background: '#fff', border: '1px solid #CED4DA', borderRadius: '6px', padding: '7px 14px', fontSize: '12px', cursor: 'pointer'}, onclick: () => { nb.loaded = false; render(); }}, 'I ran it - check again')));
+    main.appendChild(c); return;
+  }
+  if (nb.error) main.appendChild(div({style: {...nbStyle.card, color: '#C62828', fontSize: '12px'}}, 'Could not load notes: ' + nb.error));
+  if (nb.form.open) main.appendChild(nbFormCard());
+  const bytes = nb.rows.reduce((a, r) => a + (r.photos || []).reduce((b, p) => b + (p.size || 0), 0), 0), mb = bytes / 1048576;
+  if (nb.rows.length) main.appendChild(div({style: {fontSize: '11px', color: mb > NB_WARN_MB ? '#C62828' : '#666', marginBottom: '8px'}}, nb.rows.length + ' note' + (nb.rows.length > 1 ? 's' : '') + ', photos use ' + mb.toFixed(1) + ' MB' + (mb > NB_WARN_MB ? ' - close to the 1 GB free-plan limit shared with your documents' : '') + '.'));
+  else if (!nb.form.open) main.appendChild(div({style: {textAlign: 'center', padding: '30px 16px', color: '#666', fontSize: '13px', ...nbStyle.card}}, 'No notes yet. Tap + Note to add your first one.'));
+  const groups = [];
+  nb.rows.forEach(r => { let g = groups.find(x => x.trip === r.trip); if (!g) { g = {trip: r.trip, rows: []}; groups.push(g); } g.rows.push(r); });
+  groups.forEach(g => {
+    main.appendChild(div({style: {fontWeight: '800', fontSize: '13px', margin: '12px 0 6px', color: '#1A1A1A'}}, g.trip + ' ', el('span', {style: {fontWeight: '400', color: '#888', fontSize: '11px'}}, '(' + g.rows.length + ')')));
+    g.rows.forEach(r => main.appendChild(nbNoteCard(r)));
+  });
+  if (nb.viewer) {
+    const u = nb.urls[nb.viewer];
+    main.appendChild(div({style: {position: 'fixed', inset: '0', background: 'rgba(0,0,0,.88)', zIndex: '9999', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '12px'}, onclick: () => { nb.viewer = null; render(); }},
+      u ? el('img', {src: u, style: {maxWidth: '100%', maxHeight: '100%', borderRadius: '6px'}}) : div({style: {color: '#fff'}}, 'Photo not available'),
+      btn({style: {position: 'absolute', top: '12px', right: '12px', background: '#fff', border: 'none', borderRadius: '6px', padding: '6px 12px', fontSize: '13px', cursor: 'pointer', width: 'auto'}}, 'Close')));
+  }
+}
+
 function render() {
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -3768,7 +4002,7 @@ function render() {
   header.appendChild(hi);
 
   const TABS_LIST = [
-    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'dispatch',label:'Dispatch'},{id:'log',label:'Logbook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
+    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'dispatch',label:'Dispatch'},{id:'log',label:'Logbook'},{id:'notebook',label:'Notebook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
     {id:'endorse',label:'Endorsements'},{id:'training',label:'Training'},
     {id:'recency',label:'Recency'},{id:'reports',label:'Reports'},{id:'docs',label:'Documents'},{id:'import',label:'Import'},
     {id:'profile',label:'Profile'},
@@ -4121,6 +4355,9 @@ function render() {
   }
   else if (state.tab === 'dispatch') {
     dpxRender(main);
+  }
+  else if (state.tab === 'notebook') {
+    nbRender(main);
   }
   else if (state.tab === 'recency') {
     const items = curItems();
