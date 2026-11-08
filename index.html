@@ -2193,6 +2193,275 @@ function curAlertsCard() {
   return card;
 }
 
+// ---- Duty & rest (SAA FOM 7.2 / SA-CATS 121 TS 121.02.13) ------------------------------------------
+// Two-pilot Part 121 limits. A planning aid only: the operator's approved scheme and the regulation govern.
+const DUTY_LS = 'salogbook_duty_v1', DUTY_H = 3600000, DUTY_DAY = 86400000;
+const DUTY_DEFAULTS = {signOn: 75, signOff: 30, offset: 2};
+function dutyStore() { try { const s = JSON.parse(localStorage.getItem(DUTY_LS) || '{}'); return s && typeof s === 'object' ? s : {}; } catch (e) { return {}; } }
+function dutySave(s) { try { localStorage.setItem(DUTY_LS, JSON.stringify(s)); } catch (e) { /* storage blocked */ } }
+function dutyPrefs() { const s = dutyStore(); return {...DUTY_DEFAULTS, ...(s.prefs || {})}; }
+function dutyApplies() { try { return /^airline/.test(curPrefs().profileId); } catch (e) { return false; } }
+
+// FDP limits in hours by number of sectors (1..8+). Table 1 (acclimatised): by local start time of the FDP.
+const FDP_ACC = [
+  {from: 300,  to: 419,  h: [13, 12.25, 11.5, 10.75, 10, 9.25, 9, 9]},       // 05:00-06:59
+  {from: 420,  to: 839,  h: [14, 13.25, 12.5, 11.75, 11, 10.25, 9.5, 9]},    // 07:00-13:59
+  {from: 840,  to: 1259, h: [13, 12.25, 11.5, 10.75, 10, 9.25, 9, 9]},       // 14:00-20:59
+  {from: 1260, to: 1319, h: [12, 11.25, 10.5, 9.75, 9, 9, 9, 9]},            // 21:00-21:59
+  {from: 1320, to: 299,  h: [11, 10.25, 9.5, 9, 9, 9, 9, 9]},                // 22:00-04:59
+];
+// Table 2 (not acclimatised): by the length of the preceding rest.
+const FDP_NOT_ACC = {outside: [13, 12.25, 11.5, 10.75, 10, 9.25, 9], mid: [12, 11.25, 10.5, 9.75, 9, 9, 9]};
+// SA-CATS 121 TS 121.02.13 s7.1(3): with a two-pilot crew a sector scheduled over 7 h counts as several sectors.
+const FDP_LONG = {'7': {label: 'over 7 h, up to 9 h', acc: 2, not: 4}, '9': {label: 'over 9 h, up to 11 h', acc: 3, not: 4}, '11': {label: 'over 11 h', acc: 4, not: null}};
+
+function dutyFmtH(h) { if (h == null || !isFinite(h)) return '-'; const m = Math.round(h * 60); return Math.floor(m / 60) + ':' + String(m % 60).padStart(2, '0'); }
+function dutyFmtWall(ms) { return new Date(ms).toISOString().slice(0, 16).replace('T', ' '); }
+function dutyParseWall(v) { const m = /^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)/.exec(v || ''); return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : null; }
+
+// Maximum rostered FDP for a two-pilot crew. o: {startMin (local minutes after midnight), sectors, acc, restH, longBand}
+function fdpMax(o) {
+  const s = Math.max(1, Math.round(o.sectors || 1));
+  let eff = s, note = '';
+  if (o.longBand && FDP_LONG[o.longBand]) {
+    const lb = FDP_LONG[o.longBand], c = o.acc ? lb.acc : lb.not;
+    if (c == null) return {h: null, text: 'A sector scheduled for ' + lb.label + ' cannot be planned with a two-pilot crew when not acclimatised (SA-CATS 121 TS 121.02.13 s7.1(3)).'};
+    eff = s - 1 + c; note = 'a sector of ' + lb.label + ' counts as ' + c + ' sectors, so ' + eff + ' in total';
+  }
+  const i = Math.min(eff, o.acc ? 8 : 7) - 1;
+  if (o.acc) {
+    const m = o.startMin, row = FDP_ACC.find(r => r.from <= r.to ? (m >= r.from && m <= r.to) : (m >= r.from || m <= r.to));
+    return {h: row.h[i], eff, text: 'Table 1 (acclimatised): FDP starting ' + dutyFmtH(m / 60) + ' local, ' + eff + ' sector' + (eff === 1 ? '' : 's') + (note ? ' (' + note + ')' : '')};
+  }
+  const r = o.restH, mid = r != null && r > 18 && r <= 30, row = mid ? FDP_NOT_ACC.mid : FDP_NOT_ACC.outside;
+  return {h: row[i], eff, text: 'Table 2 (not acclimatised): preceding rest ' + (r != null ? r + ' h' : 'not given (18-30 h is the worst case)') + ', ' + eff + ' sector' + (eff === 1 ? '' : 's') + (note ? ' (' + note + ')' : '')};
+}
+// In-flight relief or split duty (FOM 7.2.2.2 / 7.2.2.3, TS 121.02.13 s7.2 / 7.3)
+function fdpExtend(base, kind, hrs) {
+  hrs = +hrs || 0;
+  if (kind === 'bunk' || kind === 'seat') {
+    if (hrs < 3) return {h: base, text: 'In-flight rest under 3 h does not extend the FDP.'};
+    const bunk = kind === 'bunk', cap = bunk ? 18 : 15, add = bunk ? hrs / 2 : hrs / 3, h = Math.min(base + add, cap);
+    return {h, text: 'In-flight relief (' + (bunk ? 'bunk: half' : 'seat: a third') + ' of ' + hrs + ' h rest, ceiling ' + cap + ' h): +' + dutyFmtH(h - base)};
+  }
+  if (kind === 'split') {
+    if (hrs < 3) return {h: base, text: 'A split duty break under 3 h does not extend the FDP.'};
+    if (hrs > 10) return {h: base, text: 'A break over 10 h is a rest period, not a split duty.'};
+    return {h: base + hrs / 2, text: 'Split duty (half of the ' + hrs + ' h break): +' + dutyFmtH(hrs / 2) + (hrs > 6 ? ' - a bed must be provided' : ' - a quiet, comfortable place is enough')};
+  }
+  return {h: base, text: ''};
+}
+// A local night is 8 hours falling inside 22:00-08:00 (wall-clock ms in, no time zones involved).
+function dutyHasNight(a, b) {
+  for (let d = Math.floor(a / DUTY_DAY) - 1; d <= Math.floor(b / DUTY_DAY); d++) {
+    if (Math.max(a, d * DUTY_DAY + 22 * DUTY_H) <= Math.min(b - 8 * DUTY_H, (d + 1) * DUTY_DAY)) return true;
+  }
+  return false;
+}
+function dutyTouchesNight(a, b) {
+  for (let d = Math.floor(a / DUTY_DAY) - 1; d <= Math.floor(b / DUTY_DAY); d++) {
+    if (Math.max(a, d * DUTY_DAY + 22 * DUTY_H) < Math.min(b, (d + 1) * DUTY_DAY + 8 * DUTY_H)) return true;
+  }
+  return false;
+}
+// Minimum rest after a duty that ended (sign-off) at endMs. FOM 7.2.3 / TS 121.02.13 s8(5).
+function dutyRestMin(endMs, home, dutyH) {
+  if (dutyH > 18) return {h: 18, text: 'the duty was over 18 h: 18 h rest including a local night'};
+  if (home) return {h: 12, text: '12 h at home base'};
+  if (dutyHasNight(endMs, endMs + 10 * DUTY_H)) return {h: 10, text: '10 h at the place of rest, which includes a local night'};
+  if (dutyTouchesNight(endMs, endMs + 12 * DUTY_H)) return {h: 12, text: '12 h - the rest would not include a local night'};
+  return {h: 14, text: '14 h - the rest falls outside a local night'};
+}
+
+// Plan one FDP. i: {first, last (wall-clock datetime strings), sectors, acc, restH, longBand, ext, extH, home}
+function dutyPlan(i, prefs) {
+  const off = dutyParseWall(i.first), on = dutyParseWall(i.last);
+  if (off == null || on == null) return {error: 'Enter the first off-blocks and last on-blocks times.'};
+  if (on <= off) return {error: 'The last on-blocks time must be after the first off-blocks time.'};
+  const signOn = off - prefs.signOn * 60000, signOff = on + prefs.signOff * 60000;
+  const startMin = Math.round(((signOn % DUTY_DAY) + DUTY_DAY) % DUTY_DAY / 60000);
+  const fdpH = (on - signOn) / DUTY_H, dutyH = (signOff - signOn) / DUTY_H;
+  const mx = fdpMax({startMin, sectors: i.sectors, acc: i.acc !== false, restH: i.restH === '' || i.restH == null ? null : +i.restH, longBand: i.longBand});
+  if (mx.h == null) return {error: mx.text};
+  const ex = fdpExtend(mx.h, i.ext, i.extH), limit = ex.h, margin = limit - fdpH;
+  const status = margin >= 0.5 ? 'ok' : margin >= 0 ? 'tight' : margin >= -3 ? 'disc' : 'over';
+  const rest = dutyRestMin(signOff, i.home !== false, dutyH);
+  return {signOn, signOff, off, on, startMin, fdpH, dutyH, base: mx, ext: ex, limit, margin, status, rest, nextOn: signOff + rest.h * DUTY_H,
+          latestOn: signOn + limit * DUTY_H, latestOnDisc: signOn + (limit + 3) * DUTY_H};
+}
+
+// ---- Flight-time limits from the logbook (FOM 7.2.7.1; SA-CATS 121 TS 121.02.13 s2) -------------------
+const FT_LIMITS = [['Preceding 7 days', 7, 40], ['Preceding 30 days', 30, 100], ['Preceding 90 days', 90, 300], ['Calendar year', 'year', 900], ['Preceding 365 days', 365, 1000]];
+function dutyFlightTime(flights, now) {
+  now = now || new Date();
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return FT_LIMITS.map(([label, span, max]) => {
+    const used = flights.reduce((a, f) => {
+      if (curIsSimOnly(f) || !f.date) return a;
+      const d = curParse(f.date);
+      const inWin = span === 'year' ? d.getFullYear() === now.getFullYear() && d <= now : (d > new Date(dayStart.getTime() - span * DUTY_DAY) && d <= now);
+      return inWin ? a + (+f.total_time || 0) : a;
+    }, 0);
+    return {label, used, max, left: max - used};
+  });
+}
+
+// ---- Duties reconstructed from the logbook (needs off/on blocks times, Zulu) -------------------------
+function dutyHM(s) { const m = /^(\d{1,2}):?(\d{2})$/.exec(String(s || '').trim()); return m && +m[1] < 24 && +m[2] < 60 ? +m[1] * 60 + +m[2] : null; }
+function dutyUtc(date, min) { const d = /^(\d{4})-(\d\d)-(\d\d)/.exec(date || ''); return d ? Date.UTC(+d[1], +d[2] - 1, +d[3]) + min * 60000 : null; }
+function dutyHistory(flights, prefs) {
+  const L = [];
+  flights.forEach(f => {
+    if (curIsSimOnly(f)) return;
+    const a = dutyHM(f.chocks_off), b = dutyHM(f.chocks_on); if (a == null || b == null) return;
+    const off = dutyUtc(f.date, a); if (off == null) return;
+    let on = dutyUtc(f.date, b); if (on <= off) on += DUTY_DAY;
+    L.push({off, on, f});
+  });
+  L.sort((x, y) => x.off - y.off);
+  const groups = [];
+  L.forEach(x => { const g = groups[groups.length - 1]; if (g && x.off - g[g.length - 1].on < 10 * DUTY_H) g.push(x); else groups.push([x]); });
+  return groups.map(g => {
+    const first = g[0], last = g[g.length - 1];
+    let start = first.off - prefs.signOn * 60000, end = last.on + prefs.signOff * 60000, actual = false;
+    // the logbook's own On Duty / Off Duty (Zulu) times win when they are sensible
+    const od = dutyHM(first.f.on_duty), fd = dutyHM(last.f.off_duty);
+    if (od != null) { let c = dutyUtc(first.f.date, od); if (c > first.off) c -= DUTY_DAY; if (first.off - c <= 6 * DUTY_H) { start = c; actual = true; } }
+    if (fd != null) { let c = dutyUtc(last.f.date, fd); while (c < last.on) c += DUTY_DAY; if (c - last.on <= 4 * DUTY_H) { end = c; actual = true; } }
+    const local = start + prefs.offset * DUTY_H, startMin = Math.round(((local % DUTY_DAY) + DUTY_DAY) % DUTY_DAY / 60000);
+    const fdpH = (last.on - start) / DUTY_H, mx = fdpMax({startMin, sectors: g.length, acc: true});
+    return {start, end, sectors: g.length, fdpH, dutyH: (end - start) / DUTY_H, startMin, max: mx.h, over: fdpH - mx.h, actual,
+            route: g.map(x => (x.f.dep_airport || '?')).concat([last.f.arr_airport || '?']).join('-')};
+  });
+}
+function dutyTotals(duties, now, offsetH) {
+  now = (now || new Date()).getTime();
+  const within = days => duties.filter(d => d.end > now - days * DUTY_DAY && d.start <= now);
+  const sum = a => a.reduce((x, d) => x + d.dutyH, 0);
+  const sh = (offsetH || 0) * DUTY_H, days = new Set();      // local calendar days that contain any duty
+  duties.forEach(d => { for (let t = Math.floor((d.start + sh) / DUTY_DAY); t <= Math.floor((d.end + sh) / DUTY_DAY); t++) days.add(t); });
+  const today = Math.floor((now + sh) / DUTY_DAY); let run = 0, t0 = days.has(today) ? today : today - 1;
+  while (days.has(t0)) { run++; t0--; }
+  let pair = false; for (let t = today - 13; t < today; t++) if (!days.has(t) && !days.has(t + 1)) pair = true;
+  return {d7: sum(within(7)), d28: sum(within(28)), run, pair, n7: within(7).length};
+}
+
+// Row for the dispatch pack: the planned duty of this flight against the FDP table and the flight-time limits.
+function dutyForPlan(p) {
+  if (!dutyApplies() || !p.etd || !p.eta) return null;
+  const pr = dutyPrefs(), off = p.etd.getTime() + pr.offset * DUTY_H, on = p.eta.getTime() + pr.offset * DUTY_H;
+  const w = ms => new Date(ms).toISOString().slice(0, 16);
+  const r = dutyPlan({first: w(off), last: w(on), sectors: 1, acc: true, home: true}, pr);
+  if (r.error) return null;
+  const ft = dutyFlightTime(state.flights, p.etd).find(x => x.label === 'Preceding 7 days'), hrs = (p.eta - p.etd) / DUTY_H;
+  const ftTxt = ' Flight time in the last 7 days: ' + ft.used.toFixed(1) + ' of ' + ft.max + ' h' + (ft.used + hrs > ft.max ? ' - this flight would take you over' : '') + '.';
+  const base = 'Sign-on ' + dutyFmtWall(r.signOn).slice(11) + ' local, FDP ' + dutyFmtH(r.fdpH) + ' against a maximum of ' + dutyFmtH(r.limit) + ' for one sector (' + (r.base.text.split(':')[0]) + ').';
+  const sev = r.status === 'ok' ? 'ok' : r.status === 'tight' ? 'warn' : 'bad';
+  return {sev: ft.used + hrs > ft.max ? 'bad' : sev, area: 'Duty', text: base + ftTxt + ' Check delays against the duty rules.'};
+}
+
+// ---- Duty tab -----------------------------------------------------------------------------------------
+function dutyPlanner() {
+  const st = dutyStore(); st.plan = st.plan || {sectors: 1, acc: true, home: true, ext: 'none', longBand: ''};
+  return st;
+}
+function dutyTab(main) {
+  const st = dutyPlanner(), pl = st.plan, pr = dutyPrefs();
+  const card = (title, sub) => { const c = div({style:{background:'#fff', border:'1px solid #DEE2E6', borderRadius:'8px', padding:'14px 18px', marginBottom:'14px'}}, div({style:{fontWeight:'800', fontSize:'14px'}}, title)); if (sub) c.appendChild(div({style:{fontSize:'11px', color:'#888', margin:'2px 0 8px', lineHeight:'1.5'}}, sub)); return c; };
+  const IS = {padding:'6px 8px', border:'1px solid #CED4DA', borderRadius:'6px', fontSize:'13px', maxWidth:'100%'};
+  const fld = (label, node, hint) => div({style:{marginBottom:'8px'}}, div({style:{fontSize:'11px', color:'#555', fontWeight:'700', marginBottom:'2px'}}, label), node, hint ? div({style:{fontSize:'10px', color:'#999', marginTop:'2px'}}, hint) : null);
+  const save = () => { st.plan = pl; st.prefs = pr; dutySave(st); };
+  const fin = (type, val, on, extra) => { const x = el('input', {type, style: {...IS, ...(extra || {})}}); x.value = val == null ? '' : val; x.addEventListener('change', () => { on(x.value); save(); render(); }); return x; };
+  const sl = (opts, val, on) => { const x = sel({style: IS}, ...opts.map(o => el('option', {value: o[0]}, o[1]))); x.value = val; x.addEventListener('change', () => { on(x.value); save(); render(); }); return x; };
+
+  main.appendChild(div({style:{marginBottom:'14px'}},
+    el('h2', {style:{margin:'0 0 4px', fontSize:'18px'}}, 'Duty & rest'),
+    el('p', {style:{color:'#555', fontSize:'12px', margin:0, lineHeight:'1.5'}}, 'Flight duty period limits for two-pilot crews - SAA FOM 7.2 and SA-CATS 121 TS 121.02.13. A planning aid: your approved scheme and the regulation govern.')));
+
+  // settings
+  const set = card('Sign-on and sign-off', 'Domestic: report 1 h 15 min before off-blocks and sign off 30 min after on-blocks. The FDP runs from sign-on to on-blocks of the last sector.');
+  const srow = div({style:{display:'flex', gap:'12px', flexWrap:'wrap'}});
+  srow.appendChild(fld('Sign-on (minutes before off-blocks)',fin('number', pr.signOn, v => { pr.signOn = Math.max(0, +v || 0); }, {width:'90px'})));
+  srow.appendChild(fld('Sign-off (minutes after on-blocks)',fin('number', pr.signOff, v => { pr.signOff = Math.max(0, +v || 0); }, {width:'90px'})));
+  srow.appendChild(fld('Local time (hours from UTC)',fin('number', pr.offset, v => { pr.offset = +v || 0; }, {width:'90px'}), 'South Africa is +2.'));
+  set.appendChild(srow); main.appendChild(set);
+
+  // planner
+  const c = card('FDP planner', 'Times are local time at the place where the duty starts.');
+  const g1 = div({style:{display:'flex', gap:'12px', flexWrap:'wrap'}});
+  g1.appendChild(fld('First off-blocks',fin('datetime-local', pl.first, v => { pl.first = v; })));
+  g1.appendChild(fld('Last on-blocks',fin('datetime-local', pl.last, v => { pl.last = v; })));
+  c.appendChild(g1);
+  const g2 = div({style:{display:'flex', gap:'12px', flexWrap:'wrap'}});
+  g2.appendChild(fld('Sectors',fin('number', pl.sectors, v => { pl.sectors = Math.max(1, Math.round(+v || 1)); }, {width:'70px'})));
+  g2.appendChild(fld('Acclimatised to local time?', sl([['y', 'Yes'], ['n', 'No']], pl.acc === false ? 'n' : 'y', v => { pl.acc = v === 'y'; }), '3 local nights free in the same 2-hour time band.'));
+  if (pl.acc === false) g2.appendChild(fld('Rest before this duty (hours)',fin('number', pl.restH, v => { pl.restH = v; }, {width:'90px'}), 'Not acclimatised: 18-30 h gives the lower table.'));
+  g2.appendChild(fld('Longest sector (two-pilot crew)', sl([['', 'Not over 7 h'], ...Object.keys(FDP_LONG).map(k => [k, FDP_LONG[k].label])], pl.longBand || '', v => { pl.longBand = v; })));
+  c.appendChild(g2);
+  const g3 = div({style:{display:'flex', gap:'12px', flexWrap:'wrap'}});
+  g3.appendChild(fld('Extension', sl([['none', 'None'], ['seat', 'In-flight relief - seat'], ['bunk', 'In-flight relief - bunk'], ['split', 'Split duty']], pl.ext || 'none', v => { pl.ext = v; })));
+  if (pl.ext && pl.ext !== 'none') g3.appendChild(fld(pl.ext === 'split' ? 'Break (hours, between duties)' : 'In-flight rest (hours)',fin('number', pl.extH, v => { pl.extH = v; }, {width:'90px'})));
+  g3.appendChild(fld('Duty ends at', sl([['y', 'Home base'], ['n', 'Away from base']], pl.home === false ? 'n' : 'y', v => { pl.home = v === 'y'; })));
+  c.appendChild(g3);
+  const fill = btn({style:{width:'auto', background:'#fff', color:'#006B3F', border:'1px solid #006B3F', borderRadius:'7px', padding:'8px 12px', fontSize:'12px', fontWeight:'700', cursor:'pointer', marginBottom:'8px'}, onclick:() => {
+    const pk = state.dpx && state.dpx.pack, p = pk && pk.plan;
+    if (!p || !p.etd || !p.eta) { toast('Load a flight plan on the Dispatch tab first.'); return; }
+    const w = d => new Date(d.getTime() + pr.offset * DUTY_H).toISOString().slice(0, 16);
+    pl.first = w(p.etd); pl.last = w(p.eta); pl.sectors = 1; save(); render();
+  }}, 'Fill from my dispatch flight plan');
+  c.appendChild(fill);
+
+  const r = dutyPlan(pl, pr);
+  if (r.error) c.appendChild(div({style:{fontSize:'12px', color:'#777'}}, r.error));
+  else {
+    const col = {ok: ['#E8F5E9', '#2E7D32'], tight: ['#FFF8E1', '#B26A00'], disc: ['#FFF3E0', '#C75B00'], over: ['#FDECEA', '#B71C1C']}[r.status];
+    const head = {ok: 'Within the FDP limit', tight: 'Within the limit, but less than 30 minutes spare', disc: 'Over the limit - only possible with the commander\'s discretion', over: 'Beyond the 3-hour discretion limit - not permitted except in an emergency'}[r.status];
+    const out = div({style:{background:col[0], borderLeft:'6px solid ' + col[1], borderRadius:'8px', padding:'12px 16px', marginTop:'4px'}},
+      div({style:{fontWeight:'800', color:col[1], fontSize:'15px'}}, head),
+      div({style:{fontSize:'13px', marginTop:'6px', lineHeight:'1.7'}},
+        'Sign-on ', el('b', {}, dutyFmtWall(r.signOn)), '  -  FDP ', el('b', {}, dutyFmtH(r.fdpH)), ' of a maximum ', el('b', {}, dutyFmtH(r.limit)),
+        '  (', r.margin >= 0 ? dutyFmtH(r.margin) + ' spare' : dutyFmtH(-r.margin) + ' over', ')'));
+    const L = (t) => out.appendChild(div({style:{fontSize:'12px', color:'#333', marginTop:'4px', lineHeight:'1.5'}}, t));
+    L(r.base.text + ': ' + dutyFmtH(r.base.h) + (r.ext.text ? '. ' + r.ext.text : '') + '.');
+    L('Latest on-blocks within the limit: ' + dutyFmtWall(r.latestOn) + '.  With the commander\'s discretion (up to 3 h): ' + dutyFmtWall(r.latestOnDisc) + '.');
+    if (r.status === 'disc' || r.status === 'over') L('Discretion is judged on what actually happens, not on the plan. The commander must be satisfied the flight can be made safely, record it on the flight report, and if the extension exceeds 2 h a report goes to the SACAA within 30 days.');
+    L('Sign-off ' + dutyFmtWall(r.signOff) + ' (duty ' + dutyFmtH(r.dutyH) + '). Minimum rest: ' + r.rest.text + ', so the earliest next sign-on is ' + dutyFmtWall(r.nextOn) + '. The rest must give at least 8 h at the place of rest.');
+    c.appendChild(out);
+  }
+  main.appendChild(c);
+
+  // flight-time limits
+  const ft = dutyFlightTime(state.flights, new Date());
+  const f = card('Flight time limits', 'From your logbook (simulator time not counted). The first three are the SAA FOM maxima; the SA-CATS 121 regulatory limits are 40 h in 7 days, 100 h in 30 days and 1 000 h in 365 days.');
+  ft.forEach(x => {
+    const pct = Math.min(100, x.used / x.max * 100), col = x.left < 0 ? '#B71C1C' : pct >= 90 ? '#C75B00' : '#2E7D32';
+    f.appendChild(div({style:{marginBottom:'8px'}},
+      div({style:{display:'flex', justifyContent:'space-between', fontSize:'12px'}}, el('span', {}, x.label), el('span', {style:{fontWeight:'700', color:col}}, x.used.toFixed(1) + ' / ' + x.max + ' h  -  ' + (x.left >= 0 ? x.left.toFixed(1) + ' h left' : (-x.left).toFixed(1) + ' h OVER'))),
+      div({style:{height:'6px', background:'#E9ECEF', borderRadius:'3px', marginTop:'3px'}}, div({style:{height:'6px', width: pct + '%', background:col, borderRadius:'3px'}}))));
+  });
+  main.appendChild(f);
+
+  // past duties
+  const duties = dutyHistory(state.flights, pr).filter(d => d.end > Date.now() - 60 * DUTY_DAY);
+  const tot = dutyTotals(duties, new Date(), pr.offset);
+  const h = card('Recent duties from your logbook', 'Built from the off/on blocks times in your entries (Zulu), grouped when the gap is under 10 hours, and checked against the acclimatised table. Add the On Duty / Off Duty times to an entry for exact figures. Ground duty, positioning and standby are not in the logbook, so these totals are estimates.');
+  if (!duties.length) h.appendChild(div({style:{fontSize:'12px', color:'#777'}}, 'No flights with off/on blocks times in the last 60 days.'));
+  else {
+    const wk = tot.d7 > 60 ? 'bad' : tot.d7 >= 50 ? 'warn' : 'ok';
+    h.appendChild(div({style:{fontSize:'12px', lineHeight:'1.7', marginBottom:'8px'}},
+      'Duty in the last 7 days: ', el('b', {style:{color: wk === 'bad' ? '#B71C1C' : wk === 'warn' ? '#C75B00' : '#2E7D32'}}, dutyFmtH(tot.d7)), ' (limit: average 60 h a week; 50 h in 7 days needs 24 h rest after). Last 28 days: ', el('b', {}, dutyFmtH(tot.d28)), ' (average 50 h a week = 200 h). ',
+      'Consecutive duty days: ', el('b', {style:{color: tot.run > 7 ? '#B71C1C' : '#333'}}, String(tot.run)), ' (max 7). ',
+      tot.pair ? 'Two consecutive days off found in the last 14 days.' : el('b', {style:{color:'#C75B00'}}, 'No two consecutive days off found in the last 14 days (needed in any 14).')));
+    duties.slice().reverse().slice(0, 12).forEach(d => {
+      const bad = d.over > 3, dsc = d.over > 0, col = bad ? '#B71C1C' : dsc ? '#C75B00' : '#2E7D32';
+      h.appendChild(div({style:{display:'flex', justifyContent:'space-between', gap:'8px', fontSize:'12px', padding:'5px 0', borderTop:'1px solid #F1F3F5', flexWrap:'wrap'}},
+        el('span', {}, new Date(d.start).toISOString().slice(0, 10) + '  ' + d.route + '  (' + d.sectors + ' sector' + (d.sectors > 1 ? 's' : '') + ', ' + (d.actual ? 'logged duty times' : 'estimated sign-on/off') + ')'),
+        el('span', {style:{fontWeight:'700', color:col}}, 'FDP ' + dutyFmtH(d.fdpH) + ' / max ' + dutyFmtH(d.max) + (dsc ? '  - over by ' + dutyFmtH(d.over) + (bad ? ' (beyond 3 h)' : ' (discretion)') : ''))));
+    });
+  }
+  main.appendChild(h);
+}
+
 // ---- Logbook export (CSV) ----------------------------------------------------------------------
 function csvCell(v) { v = v == null ? '' : String(v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
 const EXPORT_LAYOUTS = {
@@ -3749,6 +4018,8 @@ function dpxPreDeparture(pack) {
     if (none.length) rows.push({sev: 'info', area: 'Currency', text: none.length + ' requirement' + (none.length > 1 ? 's' : '') + ' with nothing recorded: ' + none.map(i => i.label).join(', ')});
     if (!bad.length && !warn.length) rows.push({sev: 'ok', area: 'Currency', text: 'All tracked requirements are current' + when + '.'});
   }
+  // 2b. duty: planned FDP against the table, and flight time against the limits
+  try { const dr = dutyForPlan(p); if (dr) rows.push(dr); } catch (e) { /* duty check is optional */ }
   // 2. this aircraft type
   if (p.acType) {
     const code = curTypeFamily(p.acType.split(' ')[0]), pt = curPerType(state.flights, at).find(t => t.type === code);
@@ -4868,7 +5139,7 @@ function render() {
   header.appendChild(hi);
 
   const TABS_LIST = [
-    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'dispatch',label:'Dispatch'},{id:'log',label:'Logbook'},{id:'notebook',label:'Notebook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
+    {id:'now',label:'Currency'},{id:'briefing',label:'Briefing'},{id:'dispatch',label:'Dispatch'},...(dutyApplies() ? [{id:'duty',label:'Duty'}] : []),{id:'log',label:'Logbook'},{id:'notebook',label:'Notebook'},{id:'totals',label:'Totals'},{id:'types',label:'Aircraft'},
     {id:'endorse',label:'Endorsements'},{id:'training',label:'Training'},
     {id:'recency',label:'Recency'},{id:'reports',label:'Reports'},{id:'docs',label:'Documents'},{id:'import',label:'Import'},
     {id:'profile',label:'Profile'},
@@ -5230,6 +5501,9 @@ function render() {
   }
   else if (state.tab === 'dispatch') {
     dpxRender(main);
+  }
+  else if (state.tab === 'duty') {
+    dutyTab(main);
   }
   else if (state.tab === 'notebook') {
     nbRender(main);
