@@ -1,0 +1,1 @@
+{ "name": "salogbook-tests", "private": true, "scripts": { "test": "node run.js" }, "devDependencies": { "playwright": "^1.48.0" } }
