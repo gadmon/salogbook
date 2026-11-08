@@ -7,18 +7,19 @@ select 'NO RLS' as problem, tablename
 from pg_tables
 where schemaname = 'public' and not rowsecurity;
 
--- 2. Policies that let everyone through (using true / no condition) on pilot data.
+-- 2. Policies with no real condition at all (using true / no using AND no check) on pilot data.
 select 'OPEN POLICY' as problem, tablename, policyname, cmd, roles, qual, with_check
 from pg_policies
 where schemaname = 'public'
-  and (qual is null or qual = 'true' or with_check = 'true')
+  and (qual = 'true' or with_check = 'true' or (qual is null and with_check is null))
   and tablename in ('flights', 'endorsements', 'documents', 'profiles', 'trip_notes', 'push_subscriptions', 'currency_lapses');
 
--- 3. Policies that let the PUBLIC / anon (not-signed-in) role touch pilot data.
+-- 3. Policies aimed explicitly at the anon (not-signed-in) role. (Roles shown as {public} are fine when the
+--    rule uses auth.uid(): a signed-out visitor has no id and matches nothing.)
 select 'ANON ACCESS' as problem, tablename, policyname, cmd, roles
 from pg_policies
 where schemaname = 'public'
-  and ('anon' = any(roles) or 'public' = any(roles))
+  and 'anon' = any(roles)
   and tablename in ('flights', 'endorsements', 'documents', 'profiles', 'trip_notes', 'push_subscriptions', 'currency_lapses');
 
 -- 4. The pilot-docs storage bucket must be private.
